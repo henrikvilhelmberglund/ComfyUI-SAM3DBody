@@ -1,4 +1,4 @@
-[node_reqs]
+[node_packs]
 ComfyUI-Multiband = "PozzettiAndrea/ComfyUI-Multiband"
 ComfyUI-DepthAnythingV3 = "PozzettiAndrea/ComfyUI-DepthAnythingV3"
 ComfyUI-CameraPack = "PozzettiAndrea/ComfyUI-CameraPack"
