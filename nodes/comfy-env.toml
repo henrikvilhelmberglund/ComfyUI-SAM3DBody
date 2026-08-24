@@ -9,7 +9,7 @@ av = "*"
 xorg-libsm = "*"     # libSM.so.6 required by bpy
 
 [cuda]
-packages = ["detectron2", "torch-scatter", "torch-sparse", "torch-cluster", "flash-attn", "sageattention"]
+packages = ["flash-attn", "sageattention"]
 
 [pypi-dependencies]
 comfy-kitchen = "*"
