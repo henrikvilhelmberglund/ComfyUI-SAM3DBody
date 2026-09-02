@@ -179,6 +179,13 @@ class SAM3DBodySaveSkeleton(io.ComfyNode):
         if isinstance(joint_positions, torch.Tensor):
             joint_positions = joint_positions.cpu().numpy()
 
+        # Center on joint 0 (world) so world bone ends up at armature origin.
+        # That way scaling the source armature keeps world in place — critical
+        # for the target master control staying at the correct height.
+        if len(joint_positions) > 0:
+            world_offset = joint_positions[0].copy()
+            joint_positions = joint_positions - world_offset
+
         # Save skeleton data to temporary JSON
         temp_dir = folder_paths.get_temp_directory()
         skeleton_json_path = os.path.join(temp_dir, f"skeleton_{int(time.time())}.json")
@@ -187,6 +194,28 @@ class SAM3DBodySaveSkeleton(io.ComfyNode):
             "joint_positions": joint_positions.tolist(),
             "num_joints": len(joint_positions),
         }
+
+        joint_parents = skeleton.get("joint_parents")
+        if joint_parents is not None:
+            if isinstance(joint_parents, torch.Tensor):
+                joint_parents = joint_parents.cpu().numpy()
+            if isinstance(joint_parents, np.ndarray):
+                joint_parents = joint_parents.astype(int).tolist()
+            else:
+                joint_parents = [int(p) for p in joint_parents]
+            skeleton_data["joint_parents"] = joint_parents
+
+        if len(joint_positions) == 127:
+            from .sam_3d_body.mhr_joint_names import MHR_JOINT_NAMES, MHR_TAIL_CHILD_OVERRIDES
+            skeleton_data["joint_names"] = MHR_JOINT_NAMES
+            name_to_idx = {n: i for i, n in enumerate(MHR_JOINT_NAMES)}
+            resolved = {}
+            for parent_name, child_name in MHR_TAIL_CHILD_OVERRIDES.items():
+                pi, ci = name_to_idx.get(parent_name), name_to_idx.get(child_name)
+                if pi is not None and ci is not None:
+                    resolved[str(pi)] = ci
+            if resolved:
+                skeleton_data["tail_overrides"] = resolved
 
         with open(skeleton_json_path, 'w') as f:
             json.dump(skeleton_data, f)
@@ -205,18 +234,17 @@ class SAM3DBodySaveSkeleton(io.ComfyNode):
             with open(script_path, 'w') as f:
                 f.write(blender_script)
 
-            # Run Blender
-            cmd = [
-                blender_exe,
-                '--background',
-                '--python', script_path,
-                '--',
-                skeleton_json_path,
-                output_path,
-            ]
+            # Run Blender (set SAM3DBODY_BLENDER_GUI=1 to run non-headless for debugging)
+            gui_debug = os.environ.get("SAM3DBODY_BLENDER_GUI") == "1"
+            cmd = [blender_exe]
+            if not gui_debug:
+                cmd.append('--background')
+            cmd += ['--python', script_path, '--', skeleton_json_path, output_path]
 
-            log.info(f" Running Blender to export FBX...")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            log.info(f" Running Blender to export FBX... (gui_debug={gui_debug})")
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=None if gui_debug else 60,
+                                    encoding='utf-8', errors='replace')
 
             if result.returncode != 0:
                 log.info(f" Blender stderr: {result.stderr}")
@@ -224,7 +252,11 @@ class SAM3DBodySaveSkeleton(io.ComfyNode):
                 raise RuntimeError(f"Blender export failed with return code {result.returncode}")
 
             if not os.path.exists(output_path):
-                raise RuntimeError(f"Export completed but output file not found: {output_path}")
+                raise RuntimeError(
+                    f"Export completed but output file not found: {output_path}\n"
+                    f"--- Blender stdout ---\n{result.stdout}\n"
+                    f"--- Blender stderr ---\n{result.stderr}"
+                )
 
             log.info(f" Exported skeleton as FBX")
 
@@ -269,52 +301,192 @@ class SAM3DBodySaveSkeleton(io.ComfyNode):
 import bpy
 import sys
 import json
+import traceback
 
-# Get arguments
-args = sys.argv[sys.argv.index("--") + 1:]
-skeleton_json = args[0]
-fbx_path = args[1]
+MARK = "@@SAM3D@@"
+def say(msg):
+    print(f"{MARK} {msg}", flush=True)
 
-# Load skeleton data
-with open(skeleton_json, 'r') as f:
-    skeleton_data = json.load(f)
+try:
+    say("script start")
 
-joint_positions = skeleton_data['joint_positions']
+    args = sys.argv[sys.argv.index("--") + 1:]
+    skeleton_json = args[0]
+    fbx_path = args[1]
+    say(f"skeleton_json={skeleton_json}")
+    say(f"fbx_path={fbx_path}")
 
-# Clear scene
-bpy.ops.object.select_all(action='SELECT')
-bpy.ops.object.delete()
+    with open(skeleton_json, 'r') as f:
+        skeleton_data = json.load(f)
+    joint_positions = skeleton_data['joint_positions']
+    joint_names = skeleton_data.get('joint_names')
+    joint_parents = skeleton_data.get('joint_parents')
+    tail_overrides = {int(k): int(v) for k, v in (skeleton_data.get('tail_overrides') or {}).items()}
+    say(f"loaded {len(joint_positions)} joints (named={bool(joint_names)}, parented={bool(joint_parents)}, overrides={len(tail_overrides)})")
 
-# Create armature
-bpy.ops.object.armature_add()
-armature_obj = bpy.context.active_object
-armature_obj.name = "SAM3D_Skeleton"
-armature = armature_obj.data
+    try:
+        bpy.ops.preferences.addon_enable(module="io_scene_fbx")
+        say("io_scene_fbx addon enabled")
+    except Exception as e:
+        say(f"addon_enable failed (may already be enabled): {e}")
 
-# Enter edit mode
-bpy.ops.object.mode_set(mode='EDIT')
+    for obj in list(bpy.data.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+    say("scene cleared")
 
-# Clear default bone
-armature.edit_bones.clear()
+    armature = bpy.data.armatures.new("SAM3D_Skeleton_Armature")
+    armature_obj = bpy.data.objects.new("SAM3D_Skeleton", armature)
+    bpy.context.scene.collection.objects.link(armature_obj)
+    bpy.context.view_layer.objects.active = armature_obj
+    armature_obj.select_set(True)
+    say("armature created")
 
-# Create bones for each joint
-for i, pos in enumerate(joint_positions):
-    bone = armature.edit_bones.new(f"Joint_{i:03d}")
-    bone.head = (pos[0], pos[1], pos[2])
-    bone.tail = (pos[0], pos[1] + 0.1, pos[2])  # Small offset for visualization
+    bpy.ops.object.mode_set(mode='EDIT')
 
-# Exit edit mode
-bpy.ops.object.mode_set(mode='OBJECT')
+    n = len(joint_positions)
+    use_named = joint_names and len(joint_names) == n
+    use_parents = joint_parents and len(joint_parents) == n
 
-# Export to FBX
-bpy.ops.export_scene.fbx(
-    filepath=fbx_path,
-    use_selection=False,
-    object_types={'ARMATURE'},
-    add_leaf_bones=False,
-)
+    children_of = [[] for _ in range(n)]
+    if use_parents:
+        for c, p in enumerate(joint_parents):
+            if 0 <= p < n and p != c:
+                children_of[p].append(c)
 
-print(f"Successfully exported skeleton to {fbx_path}")
+    def _tail(i):
+        h = joint_positions[i]
+        kids = children_of[i]
+        if kids:
+            chosen = tail_overrides.get(i)
+            if chosen is None or chosen not in kids:
+                chosen = kids[0]
+            t = joint_positions[chosen]
+            dx, dy, dz = t[0]-h[0], t[1]-h[1], t[2]-h[2]
+            if (dx*dx + dy*dy + dz*dz) ** 0.5 < 1e-4:
+                return (h[0], h[1] + 0.05, h[2])
+            return (t[0], t[1], t[2])
+        p = joint_parents[i] if use_parents else -1
+        if 0 <= p < n and p != i:
+            ph = joint_positions[p]
+            dx, dy, dz = h[0]-ph[0], h[1]-ph[1], h[2]-ph[2]
+            m = (dx*dx + dy*dy + dz*dz) ** 0.5
+            if m > 1e-4:
+                s = min(0.25, 0.05 / m)
+                return (h[0] + dx*s, h[1] + dy*s, h[2] + dz*s)
+        return (h[0], h[1] + 0.05, h[2])
+
+    created = []
+    for i, pos in enumerate(joint_positions):
+        name = joint_names[i] if use_named else f"Joint_{i:03d}"
+        bone = armature.edit_bones.new(name)
+        bone.head = (pos[0], pos[1], pos[2])
+        bone.tail = _tail(i)
+        created.append(bone)
+    say(f"added {n} bones")
+
+    if use_parents:
+        for i, p in enumerate(joint_parents):
+            if 0 <= p < n and p != i:
+                created[i].parent = created[p]
+                created[i].use_connect = False
+        say("parents wired")
+
+    # Character-relative roll for torso bones (character forward = right x up),
+    # so full/twist-preserving retargets don't inherit a random Blender-default roll.
+    if use_named:
+        from mathutils import Vector as _V
+        _idx = {nm: i for i, nm in enumerate(joint_names)}
+        try:
+            _l = _V(joint_positions[_idx['l_upleg']])
+            _r = _V(joint_positions[_idx['r_upleg']])
+            _root = _V(joint_positions[_idx['root']])
+            _head = _V(joint_positions[_idx['c_head']])
+            _right = _r - _l
+            _up = _head - _root
+            if _right.length > 1e-4 and _up.length > 1e-4:
+                _right.normalize(); _up.normalize()
+                _fwd = _right.cross(_up)
+                if _fwd.length > 1e-4:
+                    _fwd.normalize()
+                    for _bn in ('world', 'root', 'c_spine0', 'c_spine1', 'c_spine2', 'c_spine3', 'c_neck', 'c_head'):
+                        _b = armature.edit_bones.get(_bn)
+                        if _b is not None:
+                            _b.align_roll(_fwd)
+                    # Reorient world/root to short vertical bones so their axes
+                    # exactly match canonical — otherwise DELTA-mode retarget
+                    # picks up spine-curvature or origin offset as tilt.
+                    for _nm in ('world', 'root'):
+                        _bn = armature.edit_bones.get(_nm)
+                        if _bn is not None:
+                            _h = _bn.head
+                            _bn.tail = (_h[0] + _up.x*0.1, _h[1] + _up.y*0.1, _h[2] + _up.z*0.1)
+                            _bn.align_roll(_fwd)
+                    # Realign spine bones to overall spine direction rather than
+                    # each pointing at its immediate child. Otherwise c_spine3
+                    # points at c_neck which sits forward (cervical curve),
+                    # tilting the chest bone regardless of actual spine posture.
+                    for _sname in ('c_spine0', 'c_spine1', 'c_spine2', 'c_spine3'):
+                        _sb = armature.edit_bones.get(_sname)
+                        if _sb is not None:
+                            _sh = _sb.head
+                            _st = _sb.tail
+                            _length = ((_st[0]-_sh[0])**2 + (_st[1]-_sh[1])**2 + (_st[2]-_sh[2])**2) ** 0.5
+                            if _length < 1e-4:
+                                _length = 0.05
+                            _sb.tail = (_sh[0] + _up.x*_length, _sh[1] + _up.y*_length, _sh[2] + _up.z*_length)
+                            _sb.align_roll(_fwd)
+                    # Head roll from eye anatomy so head turn transfers
+                    _head_fwd = None
+                    try:
+                        _le = _V(joint_positions[_idx['l_eye']])
+                        _re = _V(joint_positions[_idx['r_eye']])
+                        _cn = _V(joint_positions[_idx['c_head_null']])
+                        _ch = _V(joint_positions[_idx['c_head']])
+                        _hright = _re - _le
+                        _hup = _cn - _ch
+                        if _hright.length > 1e-4 and _hup.length > 1e-4:
+                            _hright.normalize(); _hup.normalize()
+                            _hf = _hright.cross(_hup)
+                            if _hf.length > 1e-4:
+                                _hf.normalize()
+                                _head_fwd = _hf
+                                _hb = armature.edit_bones.get('c_head')
+                                if _hb is not None:
+                                    _hb.align_roll(_head_fwd)
+                    except (KeyError, IndexError):
+                        pass
+                    # Neck roll: blend body and head forward
+                    if _head_fwd is not None:
+                        _nf = (_fwd + _head_fwd) * 0.5
+                        if _nf.length > 1e-4:
+                            _nf.normalize()
+                            _nb = armature.edit_bones.get('c_neck')
+                            if _nb is not None:
+                                _nb.align_roll(_nf)
+                    say("torso rolls aligned; head roll from eye anatomy; spines to overall spine direction")
+        except (KeyError, IndexError):
+            pass
+
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    say("calling export_scene.fbx ...")
+    bpy.ops.export_scene.fbx(
+        filepath=fbx_path,
+        use_selection=False,
+        object_types={'ARMATURE'},
+        add_leaf_bones=False,
+    )
+    say(f"export_scene.fbx returned")
+
+    import os as _os
+    say(f"file exists after export: {_os.path.exists(fbx_path)}")
+    say("script done OK")
+
+except Exception:
+    say("SCRIPT FAILED with exception:")
+    for line in traceback.format_exc().splitlines():
+        say(line)
+    raise
 """
 
 

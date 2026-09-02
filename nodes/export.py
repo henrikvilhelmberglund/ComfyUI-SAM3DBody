@@ -19,6 +19,283 @@ from comfy_api.latest import io
 
 log = logging.getLogger("sam3dbody")
 
+def _align_torso_rolls_from_landmarks(bones_dict, rel_joints_corrected, joint_names_list, name_prefix=""):
+    """Give the torso chain (root, spines, neck, head) a character-relative roll
+    so their local Z-axis points along the character's forward direction.
+
+    Without this, Blender's FBX importer picks an arbitrary roll and any
+    full/twist-preserving pose transfer inherits that random twist,
+    which cascades up the spine and messes with everything downstream.
+
+    Runs while the armature is still in EDIT mode. `name_prefix` is used by
+    the multi-person exporter which prefixes each bone with "P{idx}_".
+    """
+    from mathutils import Vector
+    name_to_idx = {n: i for i, n in enumerate(joint_names_list)}
+    try:
+        l_upleg = Vector(rel_joints_corrected[name_to_idx['l_upleg']])
+        r_upleg = Vector(rel_joints_corrected[name_to_idx['r_upleg']])
+        root = Vector(rel_joints_corrected[name_to_idx['root']])
+        c_head = Vector(rel_joints_corrected[name_to_idx['c_head']])
+    except (KeyError, IndexError):
+        return
+
+    right = r_upleg - l_upleg
+    up = c_head - root
+    if right.length < 1e-4 or up.length < 1e-4:
+        return
+    right.normalize()
+    up.normalize()
+    forward = right.cross(up)
+    if forward.length < 1e-4:
+        return
+    forward.normalize()
+
+    torso = ('world', 'root', 'c_spine0', 'c_spine1', 'c_spine2', 'c_spine3', 'c_neck', 'c_head')
+    for bn in torso:
+        bone = bones_dict.get(name_prefix + bn)
+        if bone is not None:
+            bone.align_roll(forward)
+
+    # Compute head-specific forward from eye anatomy so head-turn rotation is
+    # preserved. Falls back to body forward if eye landmarks are missing.
+    try:
+        l_eye = Vector(rel_joints_corrected[name_to_idx['l_eye']])
+        r_eye = Vector(rel_joints_corrected[name_to_idx['r_eye']])
+        c_head_null = Vector(rel_joints_corrected[name_to_idx['c_head_null']])
+        c_head_pos = Vector(rel_joints_corrected[name_to_idx['c_head']])
+        head_right = r_eye - l_eye
+        head_up = c_head_null - c_head_pos
+        if head_right.length > 1e-4 and head_up.length > 1e-4:
+            head_right.normalize(); head_up.normalize()
+            head_forward = head_right.cross(head_up)
+            if head_forward.length > 1e-4:
+                head_forward.normalize()
+                head_bone = bones_dict.get(name_prefix + 'c_head')
+                if head_bone is not None:
+                    head_bone.align_roll(head_forward)
+    except (KeyError, IndexError):
+        pass
+
+    # Neck roll: blend body-forward with head-forward so partial neck turn
+    # transfers when the head is looking somewhere different from the torso.
+    if 'head_forward' in locals() and head_forward.length > 1e-4:
+        neck_forward = (forward + head_forward) * 0.5
+        if neck_forward.length > 1e-4:
+            neck_forward.normalize()
+            neck_bone = bones_dict.get(name_prefix + 'c_neck')
+            if neck_bone is not None:
+                neck_bone.align_roll(neck_forward)
+
+    # Reorient world/root to short vertical bones so their axes exactly match
+    # canonical (X=right, Y=up, Z=forward). Otherwise their Y follows their
+    # first child (e.g. world -> root, root -> c_spine0) which tilts with any
+    # spine curvature, and DELTA-mode retarget picks that up as tilt on the
+    # target's master/pelvis gizmo.
+    for _nm in ('world', 'root'):
+        _bn = bones_dict.get(name_prefix + _nm)
+        if _bn is not None:
+            _h = Vector(_bn.head)
+            _bn.tail = _h + up * 0.1
+            _bn.align_roll(forward)
+
+    # Realign spine bones to the OVERALL spine direction (root -> c_head)
+    # rather than each pointing at its immediate child. Otherwise c_spine3
+    # in particular points at c_neck which sits forward of the mid-chest
+    # (natural cervical curve), so c_spine3 tilts forward regardless of the
+    # actual spine posture.
+    for _sname in ('c_spine0', 'c_spine1', 'c_spine2', 'c_spine3'):
+        sb = bones_dict.get(name_prefix + _sname)
+        if sb is not None:
+            head_v = Vector(sb.head)
+            length = (Vector(sb.tail) - head_v).length
+            if length < 1e-4:
+                length = 0.05
+            sb.tail = head_v + up * length
+            sb.align_roll(forward)
+
+
+# Blender/MHR coord flip used by both bake helpers: (x, y, z) → (x, z, -y).
+_BAKE_T = np.array([[1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, -1.0, 0.0]], dtype=np.float32)
+
+
+def _compute_yaw_only_transform(joint_coords):
+    """Compute a rotation matrix (MHR space) that ONLY rotates around vertical
+    to align character-forward to Blender -Y. Preserves any tilt/lean/pitch,
+    so a kneeling character stays kneeling and only the horizontal facing
+    direction changes. Returns None if landmarks are missing/degenerate."""
+    try:
+        from .sam_3d_body.mhr_joint_names import MHR_JOINT_NAMES as _MJN
+        _idx = {n: i for i, n in enumerate(_MJN)}
+        _to_bl = lambda p: (_BAKE_T @ p.astype(np.float32))
+
+        # Character forward in Blender coords, from hip axis × spine, then
+        # flatten to the horizontal plane (yaw only).
+        right_bl = _to_bl(joint_coords[_idx['r_upleg']]
+                          - joint_coords[_idx['l_upleg']])
+        up_bl = _to_bl(joint_coords[_idx['c_head']]
+                       - joint_coords[_idx['root']])
+        forward_bl = np.cross(up_bl, right_bl)
+        forward_xy = np.array([forward_bl[0], forward_bl[1], 0.0],
+                              dtype=np.float32)
+        n = float(np.linalg.norm(forward_xy))
+        if n < 1e-4:
+            return None
+        forward_xy /= n
+
+        # Signed angle from forward_xy to -Y around +Z.
+        target = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+        cos_a = float(np.dot(forward_xy, target))
+        sin_a = float(forward_xy[0] * target[1] - forward_xy[1] * target[0])
+        angle = float(np.arctan2(sin_a, cos_a))
+
+        c, s = np.cos(angle), np.sin(angle)
+        R_bl = np.array([[c, -s, 0.0],
+                         [s,  c, 0.0],
+                         [0.0, 0.0, 1.0]], dtype=np.float32)
+        return (_BAKE_T.T @ R_bl @ _BAKE_T).astype(np.float32)
+    except (KeyError, IndexError):
+        return None
+
+
+def _compute_bake_facing_transform(joint_coords):
+    """Compute (R_mhr, offset_mhr) that canonicalizes a character exported by
+    the SAM3D pipeline: orient body (right, up, forward) to world (-X, +Z, -Y)
+    (Rigify convention) and shift the world bone (joint 0) to armature origin
+    with feet on the ground plane.
+
+    Returns (R_mhr, offset_mhr) — both numpy 3x3 rotation and 3-vector in MHR
+    space. Either can be None if the corresponding step is skipped due to
+    missing / degenerate landmarks.
+    """
+    if joint_coords is None or len(joint_coords) != 127:
+        return None, None
+    try:
+        from .sam_3d_body.mhr_joint_names import MHR_JOINT_NAMES as _MJN
+        _idx = {n: i for i, n in enumerate(_MJN)}
+        _to_bl = lambda p: (_BAKE_T @ p.astype(np.float32))
+
+        _right_bl = _to_bl(joint_coords[_idx['r_upleg']]
+                            - joint_coords[_idx['l_upleg']])
+        _up_bl = _to_bl(joint_coords[_idx['c_head']]
+                         - joint_coords[_idx['root']])
+        _rn = float(np.linalg.norm(_right_bl))
+        _un = float(np.linalg.norm(_up_bl))
+        R_mhr = None
+        if _rn > 1e-4 and _un > 1e-4:
+            _right_bl /= _rn
+            _up_bl /= _un
+
+            _forward_bl = None
+            try:
+                _le = _to_bl(joint_coords[_idx['l_eye']])
+                _re = _to_bl(joint_coords[_idx['r_eye']])
+                _hd = _to_bl(joint_coords[_idx['c_head']])
+                _f_eye = (_le + _re) * 0.5 - _hd
+                _f_eye = _f_eye - _up_bl * float(np.dot(_f_eye, _up_bl))
+                _fen = float(np.linalg.norm(_f_eye))
+                if _fen > 1e-4:
+                    _forward_bl = _f_eye / _fen
+            except (KeyError, IndexError):
+                pass
+            if _forward_bl is None:
+                _forward_bl = np.cross(_up_bl, _right_bl)
+                _fn = float(np.linalg.norm(_forward_bl))
+                if _fn > 1e-4:
+                    _forward_bl /= _fn
+                else:
+                    _forward_bl = None
+
+            if _forward_bl is not None:
+                _right_bl = np.cross(_forward_bl, _up_bl)
+                _rn2 = float(np.linalg.norm(_right_bl))
+                if _rn2 > 1e-4:
+                    _right_bl /= _rn2
+                    _up_bl = np.cross(_right_bl, _forward_bl)
+                    _un2 = float(np.linalg.norm(_up_bl))
+                    if _un2 > 1e-4:
+                        _up_bl /= _un2
+                        _M_char = np.stack(
+                            [_right_bl, _up_bl, _forward_bl], axis=1)
+                        _M_world = np.array([[-1.0, 0.0,  0.0],
+                                             [ 0.0, 0.0, -1.0],
+                                             [ 0.0, 1.0,  0.0]],
+                                            dtype=np.float32)
+                        _R_bl = (_M_world @ _M_char.T).astype(np.float32)
+                        R_mhr = (_BAKE_T.T @ _R_bl @ _BAKE_T).astype(np.float32)
+
+        # Offset (ground-under-root) is computed AFTER rotation, so any caller
+        # that wants the shared transform must also apply the rotation first.
+        # We return R_mhr here; the offset is computed by the apply helper
+        # (or by an explicit caller that has already rotated the joints).
+        return R_mhr, None
+    except (KeyError, ValueError, IndexError):
+        return None, None
+
+
+def _apply_bake_facing(joint_coords, vertices, R_mhr=None, offset_mhr=None,
+                       compute_missing=True, mode='full'):
+    """Apply an orientation + recenter bake to joint_coords + vertices.
+
+    mode='full' (default) canonicalizes orientation (right→-X, up→+Z, forward→-Y)
+    and recenters (world bone under root at ground level).
+    mode='yaw' only rotates around vertical to align facing with -Y and
+    recenters; any tilt/lean/pitch stays so poses (kneeling, crouching,
+    leaning) aren't distorted.
+    mode='off' is a no-op.
+
+    If R_mhr / offset_mhr are None and compute_missing=True (the default),
+    they are computed from THIS character's own landmarks (single-character
+    behavior). Pass a non-None R_mhr and/or offset_mhr to share a transform
+    across multiple characters (spatial-relationship preservation).
+
+    Returns (new_joint_coords, new_vertices, R_mhr_used, offset_mhr_used).
+    """
+    if mode == 'off':
+        return joint_coords, vertices, None, None
+    if joint_coords is None or vertices is None or len(joint_coords) != 127:
+        return joint_coords, vertices, R_mhr, offset_mhr
+
+    joint_coords = joint_coords.astype(np.float32)
+    vertices = vertices.astype(np.float32)
+
+    if R_mhr is None and compute_missing:
+        if mode == 'yaw':
+            R_mhr = _compute_yaw_only_transform(joint_coords)
+        else:
+            R_mhr, _ = _compute_bake_facing_transform(joint_coords)
+    if R_mhr is not None:
+        joint_coords = joint_coords @ R_mhr.T
+        vertices = vertices @ R_mhr.T
+
+    if offset_mhr is None and compute_missing:
+        try:
+            from .sam_3d_body.mhr_joint_names import MHR_JOINT_NAMES as _MJN
+            _idx = {n: i for i, n in enumerate(_MJN)}
+            _joints_bl = joint_coords @ _BAKE_T.T
+            _verts_bl = vertices @ _BAKE_T.T
+            _root_bl = _joints_bl[_idx['root']]
+            _min_z_bl = float(_verts_bl[:, 2].min())
+            _target_bl = np.array(
+                [_root_bl[0], _root_bl[1], _min_z_bl], dtype=np.float32)
+            offset_mhr = _target_bl @ _BAKE_T
+        except (KeyError, IndexError):
+            offset_mhr = None
+    if offset_mhr is not None:
+        joint_coords = joint_coords - offset_mhr
+        vertices = vertices - offset_mhr
+        # Only pin joint 0 to origin when the offset was derived from THIS
+        # character (single-character mode); for shared transforms across
+        # multiple characters, joint 0 legitimately sits at some offset that
+        # encodes the character's spatial position relative to the anchor.
+        if compute_missing:
+            joint_coords[0] = np.zeros(3, dtype=np.float32)
+
+    return joint_coords, vertices, R_mhr, offset_mhr
+
+
 class BpyFBXExporter:
     """Isolated bpy-based FBX exporter that runs in the sam3dbody venv."""
 
@@ -56,6 +333,7 @@ class BpyFBXExporter:
             joint_parents_list = skeleton_data.get('joint_parents')
             skinning_weights = skeleton_data.get('skinning_weights')
             global_rotations_data = skeleton_data.get('global_rotations')
+            joint_names_list = skeleton_data.get('joint_names')
 
             if joint_positions:
                 joints = np.array(joint_positions, dtype=np.float32)
@@ -125,8 +403,12 @@ class BpyFBXExporter:
             if default_bone:
                 edit_bones.remove(default_bone)
 
-            # Calculate skeleton center for root bone placement
-            skeleton_center = joints.mean(axis=0)
+            # Center the skeleton on joint 0 (MHR "world" bone) rather than
+            # the mean, so world_bone ends up at armature-local origin (0,0,0).
+            # This means scaling the source armature via src.scale doesn't
+            # move the world bone — critical for keeping the master control
+            # in place while nudging character proportions.
+            skeleton_center = joints[0].copy() if len(joints) > 0 else joints.mean(axis=0)
 
             # Make positions relative to skeleton center
             rel_joints = joints - skeleton_center
@@ -137,13 +419,53 @@ class BpyFBXExporter:
             rel_joints_corrected[:, 1] = -rel_joints[:, 2]
             rel_joints_corrected[:, 2] = rel_joints[:, 1]
 
+            use_named = joint_names_list and len(joint_names_list) == num_joints
+            def _bone_name(i):
+                return joint_names_list[i] if use_named else f'Joint_{i:03d}'
+
+            # Build child map so bones can be oriented head->child instead of head->up
+            children_of = [[] for _ in range(num_joints)]
+            if joint_parents_list and len(joint_parents_list) == num_joints:
+                for c, p in enumerate(joint_parents_list):
+                    if 0 <= p < num_joints and p != c:
+                        children_of[p].append(c)
+
+            # Anatomical overrides: pick a specific child for bones where "first by index"
+            # gives a bad direction (e.g., pelvis -> spine, not -> leg).
+            _tail_overrides_by_idx = {}
+            if use_named:
+                from .sam_3d_body.mhr_joint_names import MHR_TAIL_CHILD_OVERRIDES
+                name_to_idx = {n: i for i, n in enumerate(joint_names_list)}
+                for parent_name, child_name in MHR_TAIL_CHILD_OVERRIDES.items():
+                    pi, ci = name_to_idx.get(parent_name), name_to_idx.get(child_name)
+                    if pi is not None and ci is not None and ci in children_of[pi]:
+                        _tail_overrides_by_idx[pi] = ci
+
+            def _tail_for(i):
+                head = rel_joints_corrected[i]
+                kids = children_of[i]
+                if kids:
+                    chosen = _tail_overrides_by_idx.get(i, kids[0])
+                    tail = rel_joints_corrected[chosen]
+                    if float(np.linalg.norm(tail - head)) < 1e-4:
+                        return head + np.array([0.0, 0.0, extrude_size], dtype=np.float32)
+                    return tail
+                p = joint_parents_list[i] if joint_parents_list else -1
+                if 0 <= p < num_joints and p != i:
+                    d = head - rel_joints_corrected[p]
+                    n = float(np.linalg.norm(d))
+                    if n > 1e-4:
+                        return head + d * min(0.25, extrude_size / n)
+                return head + np.array([0.0, 0.0, extrude_size], dtype=np.float32)
+
             # Create all bones
             bones_dict = {}
             for i in range(num_joints):
-                bone_name = f'Joint_{i:03d}'
+                bone_name = _bone_name(i)
                 bone = edit_bones.new(bone_name)
-                bone.head = Vector((rel_joints_corrected[i, 0], rel_joints_corrected[i, 1], rel_joints_corrected[i, 2]))
-                bone.tail = Vector((rel_joints_corrected[i, 0], rel_joints_corrected[i, 1], rel_joints_corrected[i, 2] + extrude_size))
+                bone.head = Vector((float(rel_joints_corrected[i, 0]), float(rel_joints_corrected[i, 1]), float(rel_joints_corrected[i, 2])))
+                tail_pos = _tail_for(i)
+                bone.tail = Vector((float(tail_pos[0]), float(tail_pos[1]), float(tail_pos[2])))
                 bones_dict[bone_name] = bone
 
             # Build hierarchical structure using joint parents if available
@@ -151,17 +473,20 @@ class BpyFBXExporter:
                 for i in range(num_joints):
                     parent_idx = joint_parents_list[i]
                     if parent_idx >= 0 and parent_idx < num_joints and parent_idx != i:
-                        bone_name = f'Joint_{i:03d}'
-                        parent_bone_name = f'Joint_{parent_idx:03d}'
-                        bones_dict[bone_name].parent = bones_dict[parent_bone_name]
-                        bones_dict[bone_name].use_connect = False
+                        bones_dict[_bone_name(i)].parent = bones_dict[_bone_name(parent_idx)]
+                        bones_dict[_bone_name(i)].use_connect = False
             else:
-                # Fallback: create flat hierarchy with Joint_000 as root
-                root_bone_name = 'Joint_000'
+                # Fallback: create flat hierarchy with the first bone as root
+                root_bone_name = _bone_name(0)
                 for i in range(1, num_joints):
-                    bone_name = f'Joint_{i:03d}'
-                    bones_dict[bone_name].parent = bones_dict[root_bone_name]
-                    bones_dict[bone_name].use_connect = False
+                    bones_dict[_bone_name(i)].parent = bones_dict[root_bone_name]
+                    bones_dict[_bone_name(i)].use_connect = False
+
+            # Give torso bones a character-relative roll so their local Z-axis points
+            # forward. Without this, Blender's FBX importer assigns arbitrary rolls
+            # and any full/roll-preserving retarget picks up random twist.
+            if use_named:
+                _align_torso_rolls_from_landmarks(bones_dict, rel_joints_corrected, joint_names_list)
 
             # Switch to object mode
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -177,8 +502,7 @@ class BpyFBXExporter:
             if skinning_weights:
                 # Create vertex groups for each bone
                 for i in range(num_joints):
-                    bone_name = f'Joint_{i:03d}'
-                    mesh_obj.vertex_groups.new(name=bone_name)
+                    mesh_obj.vertex_groups.new(name=_bone_name(i))
 
                 # Assign weights to vertices
                 num_vertices = len(mesh_obj.data.vertices)
@@ -187,8 +511,7 @@ class BpyFBXExporter:
                     if influences and len(influences) > 0:
                         for bone_idx, weight in influences:
                             if 0 <= bone_idx < num_joints and weight > 0.0001:
-                                bone_name = f'Joint_{bone_idx:03d}'
-                                vertex_group = mesh_obj.vertex_groups.get(bone_name)
+                                vertex_group = mesh_obj.vertex_groups.get(_bone_name(bone_idx))
                                 if vertex_group:
                                     vertex_group.add([vert_idx], weight, 'REPLACE')
 
@@ -299,6 +622,7 @@ class BpyFBXExporter:
                 joint_parents_list = skeleton_data.get('joint_parents')
                 skinning_weights = skeleton_data.get('skinning_weights')
                 global_rotations_data = skeleton_data.get('global_rotations')
+                joint_names_list = skeleton_data.get('joint_names')
 
                 if joint_positions:
                     joints = np.array(joint_positions, dtype=np.float32)
@@ -344,8 +668,8 @@ class BpyFBXExporter:
                 if default_bone:
                     edit_bones.remove(default_bone)
 
-                # Calculate skeleton center for root bone placement
-                skeleton_center = joints.mean(axis=0)
+                # Center on joint 0 (world) so scaling doesn't move it.
+                skeleton_center = joints[0].copy() if len(joints) > 0 else joints.mean(axis=0)
 
                 # Make positions relative to skeleton center
                 rel_joints = joints - skeleton_center
@@ -356,13 +680,51 @@ class BpyFBXExporter:
                 rel_joints_corrected[:, 1] = -rel_joints[:, 2]
                 rel_joints_corrected[:, 2] = rel_joints[:, 1]
 
-                # Create all bones with unique names for this person
+                # Create all bones with per-person prefix so multi-armature scenes stay unique
+                use_named = joint_names_list and len(joint_names_list) == num_joints
+                def _bone_name(i):
+                    base = joint_names_list[i] if use_named else f'Joint_{i:03d}'
+                    return f'P{idx}_{base}'
+
+                children_of = [[] for _ in range(num_joints)]
+                if joint_parents_list and len(joint_parents_list) == num_joints:
+                    for c, p in enumerate(joint_parents_list):
+                        if 0 <= p < num_joints and p != c:
+                            children_of[p].append(c)
+
+                _tail_overrides_by_idx = {}
+                if use_named:
+                    from .sam_3d_body.mhr_joint_names import MHR_TAIL_CHILD_OVERRIDES
+                    name_to_idx = {n: i for i, n in enumerate(joint_names_list)}
+                    for parent_name, child_name in MHR_TAIL_CHILD_OVERRIDES.items():
+                        pi, ci = name_to_idx.get(parent_name), name_to_idx.get(child_name)
+                        if pi is not None and ci is not None and ci in children_of[pi]:
+                            _tail_overrides_by_idx[pi] = ci
+
+                def _tail_for(i):
+                    head = rel_joints_corrected[i]
+                    kids = children_of[i]
+                    if kids:
+                        chosen = _tail_overrides_by_idx.get(i, kids[0])
+                        tail = rel_joints_corrected[chosen]
+                        if float(np.linalg.norm(tail - head)) < 1e-4:
+                            return head + np.array([0.0, 0.0, extrude_size], dtype=np.float32)
+                        return tail
+                    p = joint_parents_list[i] if joint_parents_list else -1
+                    if 0 <= p < num_joints and p != i:
+                        d = head - rel_joints_corrected[p]
+                        n = float(np.linalg.norm(d))
+                        if n > 1e-4:
+                            return head + d * min(0.25, extrude_size / n)
+                    return head + np.array([0.0, 0.0, extrude_size], dtype=np.float32)
+
                 bones_dict = {}
                 for i in range(num_joints):
-                    bone_name = f'P{idx}_Joint_{i:03d}'
+                    bone_name = _bone_name(i)
                     bone = edit_bones.new(bone_name)
-                    bone.head = Vector((rel_joints_corrected[i, 0], rel_joints_corrected[i, 1], rel_joints_corrected[i, 2]))
-                    bone.tail = Vector((rel_joints_corrected[i, 0], rel_joints_corrected[i, 1], rel_joints_corrected[i, 2] + extrude_size))
+                    bone.head = Vector((float(rel_joints_corrected[i, 0]), float(rel_joints_corrected[i, 1]), float(rel_joints_corrected[i, 2])))
+                    tail_pos = _tail_for(i)
+                    bone.tail = Vector((float(tail_pos[0]), float(tail_pos[1]), float(tail_pos[2])))
                     bones_dict[bone_name] = bone
 
                 # Build hierarchical structure using joint parents if available
@@ -370,17 +732,20 @@ class BpyFBXExporter:
                     for i in range(num_joints):
                         parent_idx = joint_parents_list[i]
                         if parent_idx >= 0 and parent_idx < num_joints and parent_idx != i:
-                            bone_name = f'P{idx}_Joint_{i:03d}'
-                            parent_bone_name = f'P{idx}_Joint_{parent_idx:03d}'
-                            bones_dict[bone_name].parent = bones_dict[parent_bone_name]
-                            bones_dict[bone_name].use_connect = False
+                            bones_dict[_bone_name(i)].parent = bones_dict[_bone_name(parent_idx)]
+                            bones_dict[_bone_name(i)].use_connect = False
                 else:
-                    # Fallback: create flat hierarchy with Joint_000 as root
-                    root_bone_name = f'P{idx}_Joint_000'
+                    # Fallback: create flat hierarchy with the first bone as root
+                    root_bone_name = _bone_name(0)
                     for i in range(1, num_joints):
-                        bone_name = f'P{idx}_Joint_{i:03d}'
-                        bones_dict[bone_name].parent = bones_dict[root_bone_name]
-                        bones_dict[bone_name].use_connect = False
+                        bones_dict[_bone_name(i)].parent = bones_dict[root_bone_name]
+                        bones_dict[_bone_name(i)].use_connect = False
+
+                if use_named:
+                    _align_torso_rolls_from_landmarks(
+                        bones_dict, rel_joints_corrected, joint_names_list,
+                        name_prefix=f'P{idx}_',
+                    )
 
                 # Switch to object mode
                 bpy.ops.object.mode_set(mode='OBJECT')
@@ -396,8 +761,7 @@ class BpyFBXExporter:
                 if skinning_weights:
                     # Create vertex groups for each bone
                     for i in range(num_joints):
-                        bone_name = f'P{idx}_Joint_{i:03d}'
-                        mesh_obj.vertex_groups.new(name=bone_name)
+                        mesh_obj.vertex_groups.new(name=_bone_name(i))
 
                     # Assign weights to vertices
                     num_vertices = len(mesh_obj.data.vertices)
@@ -406,8 +770,7 @@ class BpyFBXExporter:
                         if influences and len(influences) > 0:
                             for bone_idx, weight in influences:
                                 if 0 <= bone_idx < num_joints and weight > 0.0001:
-                                    bone_name = f'P{idx}_Joint_{bone_idx:03d}'
-                                    vertex_group = mesh_obj.vertex_groups.get(bone_name)
+                                    vertex_group = mesh_obj.vertex_groups.get(_bone_name(bone_idx))
                                     if vertex_group:
                                         vertex_group.add([vert_idx], weight, 'REPLACE')
 
@@ -617,6 +980,18 @@ class SAM3DBodyExportFBX(io.ComfyNode):
                     tooltip="Mesh data from SAM3D Body Process node"),
                 io.String.Input("output_filename", default="sam3d_rigged.fbx",
                     tooltip="Output filename for the FBX file"),
+                io.Boolean.Input("overwrite", default=False,
+                    tooltip="When enabled, always write to the exact filename above (overwriting). "
+                            "When disabled, appends an incrementing counter so each run creates a new file."),
+                io.Combo.Input("bake_facing",
+                    options=["off", "yaw", "full"], default="off",
+                    tooltip="off: no reorientation.  yaw: rotate around vertical only so the "
+                            "character faces world -Y (Rigify convention); any tilt/lean/pitch of "
+                            "the pose is preserved, so kneeling / crouching / leaning poses look "
+                            "the same.  full: also make the character perfectly upright (may "
+                            "reinterpret leaned poses — e.g. a leaning-forward kneel becomes an "
+                            "upright squat).  Both baked modes also recenter the world bone under "
+                            "the character's feet."),
             ],
             outputs=[
                 io.String.Output(display_name="fbx_path"),
@@ -624,7 +999,7 @@ class SAM3DBodyExportFBX(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, mesh_data, output_filename):
+    def execute(cls, mesh_data, output_filename, overwrite=False, bake_facing="off"):
         """Export mesh with skeleton to FBX format."""
 
         # Extract mesh data
@@ -643,11 +1018,25 @@ class SAM3DBodyExportFBX(io.ComfyNode):
         if joint_coords is not None and isinstance(joint_coords, torch.Tensor):
             joint_coords = joint_coords.cpu().numpy()
 
-        # Prepare output path
-        output_dir = folder_paths.get_output_directory()
+        # Prepare output path: either overwrite the fixed filename, or use
+        # Comfy's incrementing counter so each run creates a fresh file.
         if not output_filename.endswith('.fbx'):
             output_filename = output_filename + '.fbx'
-        output_fbx_path = os.path.join(output_dir, output_filename)
+        if overwrite:
+            output_fbx_path = os.path.join(folder_paths.get_output_directory(), output_filename)
+        else:
+            filename_prefix = output_filename[:-4]
+            full_output_folder, filename_base, counter, _subfolder, _filename_prefix = \
+                folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory())
+            output_filename = f"{filename_base}_{counter:05}_.fbx"
+            output_fbx_path = os.path.join(full_output_folder, output_filename)
+
+        # Optional orientation bake — logic is in _apply_bake_facing so it can
+        # be shared with the two-character export node (which needs to apply
+        # ONE transform to both characters to preserve their spatial relation).
+        if bake_facing and bake_facing != "off":
+            joint_coords, vertices, _r, _o = _apply_bake_facing(
+                joint_coords, vertices, mode=bake_facing)
 
         # Create a simple OBJ file first (Blender can import this easily)
         temp_dir = folder_paths.get_temp_directory()
@@ -685,6 +1074,10 @@ class SAM3DBodyExportFBX(io.ComfyNode):
                 "mesh_vertices_bounds_min": mesh_min,
                 "mesh_vertices_bounds_max": mesh_max,
             }
+
+            if len(joint_coords) == 127:
+                from .sam_3d_body.mhr_joint_names import MHR_JOINT_NAMES
+                skeleton_data["joint_names"] = MHR_JOINT_NAMES
 
             # Extract skinning weights from MHR model
             try:
@@ -780,7 +1173,7 @@ class SAM3DBodyExportFBX(io.ComfyNode):
             if not os.path.exists(output_fbx_path):
                 raise RuntimeError(f"Export completed but output file not found: {output_fbx_path}")
 
-            return io.NodeOutput(output_fbx_path)
+            return io.NodeOutput(os.path.basename(output_fbx_path))
 
         finally:
             # Clean up temporary files
@@ -939,6 +1332,10 @@ class SAM3DBodyExportMultipleFBX(io.ComfyNode):
                         "num_joints": len(joint_coords),
                     }
 
+                    if len(joint_coords) == 127:
+                        from .sam_3d_body.mhr_joint_names import MHR_JOINT_NAMES
+                        skeleton_info["joint_names"] = MHR_JOINT_NAMES
+
                     # Add skinning weights (build per-vertex data)
                     if vertex_weights:
                         num_vertices = len(vertices)
@@ -1019,7 +1416,7 @@ class SAM3DBodyExportMultipleFBX(io.ComfyNode):
                     raise RuntimeError("Combined FBX export failed")
 
                 log.info(f" Combined FBX created: {output_fbx_path}")
-                return io.NodeOutput(output_fbx_path)
+                return io.NodeOutput(os.path.basename(output_fbx_path))
 
             else:
                 # Separate mode: export each person to individual FBX files
@@ -1068,7 +1465,7 @@ class SAM3DBodyExportMultipleFBX(io.ComfyNode):
                 # Return the first exported file (separate mode returns first file for compatibility)
                 output_fbx_path = exported_files[0]
                 log.info(f" Separate FBX files created: {len(exported_files)} files")
-                return io.NodeOutput(output_fbx_path)
+                return io.NodeOutput(os.path.basename(output_fbx_path))
 
         finally:
             # Clean up temp files
@@ -1089,13 +1486,187 @@ class SAM3DBodyExportMultipleFBX(io.ComfyNode):
                 f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
 
 
+class SAM3DBodyExportTwoCharactersFBX(io.ComfyNode):
+    """
+    Process one image containing TWO characters with a mask that isolates
+    character A. Runs the SAM3D pipeline twice — once with the mask (character
+    A), once with the inverted mask (character B) — and exports each result
+    to its own FBX file.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SAM3DBodyExportTwoCharactersFBX",
+            display_name="SAM 3D Body: Export Two Characters (FBX)",
+            category="SAM3DBody/export",
+            is_output_node=True,
+            inputs=[
+                io.Custom("SAM3D_MODEL").Input("model",
+                    tooltip="Loaded SAM 3D Body model from Load node"),
+                io.Image.Input("image",
+                    tooltip="Input image containing two humans"),
+                io.Mask.Input("mask",
+                    tooltip="Mask isolating character A"),
+                io.Mask.Input("mask_b", optional=True,
+                    tooltip="Optional mask isolating character B. If omitted, the inverted "
+                            "'mask' input is used — but that inverted region covers most of the "
+                            "image so the detector can accidentally pick character A again. "
+                            "Provide an explicit tight mask for character B (e.g. from another "
+                            "SAM/RMBG pass) to guarantee the correct character is detected."),
+                io.String.Input("output_filename_a", default="sam3d_char_a.fbx",
+                    tooltip="Output FBX filename for character A (the one under the given mask)"),
+                io.String.Input("output_filename_b", default="sam3d_char_b.fbx",
+                    tooltip="Output FBX filename for character B (the one under the inverted mask)"),
+                io.Boolean.Input("overwrite", default=False,
+                    tooltip="When enabled, both filenames are written verbatim (overwriting). "
+                            "When disabled, an incrementing counter is appended so each run creates new files."),
+                io.Combo.Input("bake_facing",
+                    options=["off", "yaw", "full"], default="off",
+                    tooltip="off: no reorientation.  yaw: rotate around vertical only to face -Y "
+                            "(preserves tilt/lean/pitch — kneeling stays kneeling).  full: also "
+                            "straighten the character upright.  In both baked modes the transform "
+                            "is computed from CHARACTER A and applied to BOTH, so the two-character "
+                            "spatial relationship is preserved."),
+                io.Boolean.Input("preserve_scene_positions", default=True,
+                    tooltip="When enabled, each character's model output is placed at its "
+                            "camera-space world position (via pred_cam_t) BEFORE the bake, so the "
+                            "two characters land at the spatial offset they had in the original "
+                            "image. Disable to have both characters centered on their own body "
+                            "(they will overlap when imported into the same scene)."),
+                io.Float.Input("bbox_threshold", default=0.8, min=0.0, max=1.0, step=0.05,
+                    tooltip="Detection confidence threshold"),
+                io.Float.Input("nms_threshold", default=0.3, min=0.0, max=1.0, step=0.05,
+                    tooltip="NMS threshold"),
+                io.Combo.Input("inference_type", options=["full", "body", "hand"],
+                    default="full",
+                    tooltip="full = body + hand decoders, body = body decoder only, hand = hand only"),
+            ],
+            outputs=[
+                io.String.Output(display_name="fbx_path_a"),
+                io.String.Output(display_name="fbx_path_b"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, image, mask,
+                output_filename_a="sam3d_char_a.fbx",
+                output_filename_b="sam3d_char_b.fbx",
+                overwrite=False, bake_facing="off",
+                preserve_scene_positions=True,
+                bbox_threshold=0.8, nms_threshold=0.3,
+                inference_type="full", mask_b=None):
+        # Import the process node lazily to avoid a circular import at module load.
+        from .process import SAM3DBodyProcessAdvanced
+
+        # Character B mask: prefer the caller-supplied mask_b (tight per-character
+        # bbox = reliable detection). Otherwise fall back to inverted mask_a,
+        # which covers most of the image and can occasionally let the detector
+        # pick character A again for both outputs.
+        if mask_b is not None:
+            char_b_mask = mask_b
+        elif isinstance(mask, torch.Tensor):
+            char_b_mask = 1.0 - mask
+        else:
+            import numpy as _np
+            char_b_mask = 1.0 - _np.asarray(mask)
+
+        def _process(m):
+            out = SAM3DBodyProcessAdvanced.execute(
+                model=model, image=image,
+                bbox_threshold=bbox_threshold, nms_threshold=nms_threshold,
+                inference_type=inference_type,
+                detector_name="none", segmentor_name="none", fov_name="none",
+                detector_path="", segmentor_path="", fov_path="",
+                mask=m,
+            )
+            # NodeOutput exposes the return tuple via .args; mesh_data is [0].
+            return out.args[0]
+
+        mesh_a = _process(mask)
+        mesh_b = _process(char_b_mask)
+
+        # Place each character at its camera-space world position (pred_cam_t)
+        # so the two-character spatial offset from the source image is preserved.
+        # Without this, both characters are output centered on their own body
+        # and overlap when imported into the same Blender scene.
+        if preserve_scene_positions:
+            def _apply_cam_t(md):
+                cam_t = md.get("camera")
+                if cam_t is None:
+                    return
+                if isinstance(cam_t, torch.Tensor):
+                    cam_t = cam_t.cpu().numpy()
+                cam_t = np.asarray(cam_t, dtype=np.float32).reshape(-1)
+                v = md.get("vertices")
+                j = md.get("joint_coords")
+                if v is not None:
+                    if isinstance(v, torch.Tensor):
+                        v = v.cpu().numpy()
+                    md["vertices"] = v.astype(np.float32) + cam_t
+                if j is not None:
+                    if isinstance(j, torch.Tensor):
+                        j = j.cpu().numpy()
+                    md["joint_coords"] = j.astype(np.float32) + cam_t
+
+            _apply_cam_t(mesh_a)
+            _apply_cam_t(mesh_b)
+
+        # If bake_facing is on, compute the transform ONCE from character A
+        # and apply the SAME transform to both. That way A ends up at the
+        # canonical origin and B lands at its correct offset relative to A —
+        # spatial relationship between the two characters is preserved
+        # instead of each getting individually re-centered to origin.
+        if bake_facing and bake_facing != "off":
+            def _to_np(x):
+                return x.cpu().numpy() if isinstance(x, torch.Tensor) else x
+
+            ja = _to_np(mesh_a.get('joint_coords'))
+            va = _to_np(mesh_a.get('vertices'))
+            jb = _to_np(mesh_b.get('joint_coords'))
+            vb = _to_np(mesh_b.get('vertices'))
+
+            # Character A: compute + apply, get the shared (R, offset) back.
+            ja, va, R_shared, off_shared = _apply_bake_facing(
+                ja, va, mode=bake_facing)
+            # Character B: apply the SAME (R, offset). compute_missing=False
+            # tells the helper NOT to derive its own transform from B's
+            # landmarks and NOT to pin B's joint 0 to origin — its post-shift
+            # position encodes B's spatial location relative to A.
+            jb, vb, _, _ = _apply_bake_facing(
+                jb, vb, R_mhr=R_shared, offset_mhr=off_shared,
+                compute_missing=False, mode=bake_facing)
+
+            mesh_a['joint_coords'] = ja
+            mesh_a['vertices'] = va
+            mesh_b['joint_coords'] = jb
+            mesh_b['vertices'] = vb
+
+        # Export both with bake_facing=False (the transform, if any, was
+        # already applied above with a shared reference).
+        def _export_no_bake(mesh_data, filename):
+            out = SAM3DBodyExportFBX.execute(
+                mesh_data=mesh_data,
+                output_filename=filename,
+                overwrite=overwrite,
+                bake_facing="off",
+            )
+            return out.args[0]
+
+        path_a = _export_no_bake(mesh_a, output_filename_a)
+        path_b = _export_no_bake(mesh_b, output_filename_b)
+        return io.NodeOutput(path_a, path_b)
+
+
 # Register nodes
 NODE_CLASS_MAPPINGS = {
     "SAM3DBodyExportFBX": SAM3DBodyExportFBX,
     "SAM3DBodyExportMultipleFBX": SAM3DBodyExportMultipleFBX,
+    "SAM3DBodyExportTwoCharactersFBX": SAM3DBodyExportTwoCharactersFBX,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3DBodyExportFBX": "SAM 3D Body: Export FBX",
     "SAM3DBodyExportMultipleFBX": "SAM 3D Body: Export Multiple FBX",
+    "SAM3DBodyExportTwoCharactersFBX": "SAM 3D Body: Export Two Characters (FBX)",
 }

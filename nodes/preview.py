@@ -43,7 +43,9 @@ class SAM3DBodyPreviewRiggedMesh(io.ComfyNode):
 
         fbx_path = fbx_output_path
         if not os.path.exists(fbx_path):
-            raise RuntimeError(f"FBX file not found: {fbx_path}")
+            fbx_path = os.path.join(folder_paths.get_output_directory(), fbx_output_path)
+            if not os.path.exists(fbx_path):
+                raise RuntimeError(f"FBX file not found: {fbx_output_path}")
 
         log.info(f" FBX path: {fbx_path}")
 
