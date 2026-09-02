@@ -296,16 +296,191 @@ def _apply_bake_facing(joint_coords, vertices, R_mhr=None, offset_mhr=None,
     return joint_coords, vertices, R_mhr, offset_mhr
 
 
+def _compute_face_shape_key_data(mesh_data, R_mhr=None, offset_mhr=None):
+    """Compute per-vertex data for the 72 MHR face-expression shape keys.
+
+    Runs the MHR model 73 times (base with expr=0, then one basis per
+    coefficient with expr[i]=1) and returns:
+      - base_vertices: (V, 3) numpy in MHR space, transformed by (R_mhr, offset_mhr)
+        the same way the main exported mesh is.
+      - deltas: (72, V, 3) numpy — per-basis vertex offsets, rotated by R_mhr but
+        NOT shifted (they are vector deltas, not absolute positions).
+      - values: (72,) numpy — the CURRENT expression coefficients, so setting
+        each shape key to these values reproduces the original posed+expressioned
+        mesh (MHR expression is a linear blendshape basis).
+      - names: list of "expr_00" .. "expr_71" so users can rename them later.
+
+    Returns None on any failure (missing params, missing MHR path, etc.).
+    """
+    try:
+        pose_params = mesh_data.get("pose_params")
+        if not isinstance(pose_params, dict):
+            return None
+        shape_p = pose_params.get("shape")
+        body_p = pose_params.get("body_pose")
+        expr_p = pose_params.get("expr")
+        if shape_p is None or body_p is None or expr_p is None:
+            return None
+
+        mhr_path = find_mhr_model_path(mesh_data)
+        if not mhr_path or not os.path.exists(mhr_path):
+            log.warning(" Shape-key bake requested but MHR model path not found.")
+            return None
+
+        def _to_tensor(x):
+            if isinstance(x, torch.Tensor):
+                return x.detach().float().cpu()
+            return torch.from_numpy(np.asarray(x, dtype=np.float32))
+
+        shape_t = _to_tensor(shape_p).reshape(-1)
+        body_t = _to_tensor(body_p).reshape(-1)
+        expr_t = _to_tensor(expr_p).reshape(-1)
+        n_expr = int(expr_t.shape[0])
+
+        mhr_model = torch.jit.load(mhr_path, map_location='cpu')
+        mhr_model.eval()
+
+        with torch.no_grad():
+            # Batched forward: row 0 is base (expr=0), rows 1..n are basis
+            # meshes (only i-th coefficient set to 1). Batching keeps the
+            # forward count to one call instead of 73.
+            n_batch = n_expr + 1
+            shape_b = shape_t.unsqueeze(0).expand(n_batch, -1).contiguous()
+            body_b = body_t.unsqueeze(0).expand(n_batch, -1).contiguous()
+            expr_b = torch.zeros((n_batch, n_expr), dtype=torch.float32)
+            for i in range(n_expr):
+                expr_b[i + 1, i] = 1.0
+
+            try:
+                verts_all, _ = mhr_model(shape_b, body_b, expr_b)
+            except Exception as _e:
+                log.warning(f" Batched shape-key MHR forward failed ({_e}); falling back to per-basis.")
+                # Fall back to one-at-a-time if the model can't handle the batch.
+                verts_list = []
+                for i in range(n_batch):
+                    v, _ = mhr_model(shape_b[i:i+1], body_b[i:i+1], expr_b[i:i+1])
+                    verts_list.append(v[0])
+                verts_all = torch.stack(verts_list, dim=0)
+
+        verts_all_np = verts_all.detach().cpu().numpy().astype(np.float32)
+        if verts_all_np.ndim == 3 and verts_all_np.shape[0] == n_batch:
+            base = verts_all_np[0]
+            basis = verts_all_np[1:]
+        else:
+            log.warning(f" Unexpected MHR shape-key output shape: {verts_all_np.shape}")
+            return None
+
+        # Deltas are vector offsets (no translation), basis - base.
+        deltas = basis - base[None, :, :]
+
+        # Apply the SAME bake transform used for the main exported mesh so the
+        # shape keys line up. Rotation applies to both base positions and
+        # delta vectors; offset applies only to base positions.
+        if R_mhr is not None:
+            base = base @ R_mhr.T
+            # (72, V, 3) @ (3, 3) — reshape via einsum for clarity.
+            deltas = np.einsum('bvi,ji->bvj', deltas, R_mhr)
+        if offset_mhr is not None:
+            base = base - offset_mhr
+
+        # Prefer the FACS-style semantic names from Meta's MHR docs
+        # (browLowerer_L, jawDrop, etc.) so shape keys are immediately
+        # editable — fall back to generic expr_NN if the coefficient count
+        # doesn't match the 72-basis MHR v1.x layout.
+        try:
+            from .sam_3d_body.mhr_face_expression_names import MHR_FACE_EXPRESSION_NAMES
+            if n_expr == len(MHR_FACE_EXPRESSION_NAMES):
+                names = list(MHR_FACE_EXPRESSION_NAMES)
+            else:
+                names = [f"expr_{i:02d}" for i in range(n_expr)]
+        except Exception:
+            names = [f"expr_{i:02d}" for i in range(n_expr)]
+
+        return {
+            "base_vertices": base,
+            "deltas": deltas,
+            "values": expr_t.numpy().astype(np.float32),
+            "names": names,
+        }
+    except Exception as _e:
+        log.warning(f" Shape-key bake failed: {_e}")
+        return None
+
+
+def _apply_face_shape_keys_from_json(mesh_obj, shape_keys_json_path, name_prefix=""):
+    """Add MHR face-expression shape keys to a mesh from a JSON file.
+
+    The JSON stores base_vertices (V, 3), deltas (72, V, 3), values (72,), and
+    names (list of 72 strings). Basis vertices are set to base_vertices (in
+    Blender coords — Y and Z flipped, matching the OBJ we wrote), and each
+    expression shape key is created as Basis + delta[i], then activated to the
+    stored value so the mesh visually matches the original posed+expressioned
+    result.
+
+    Runs inside the bpy venv; the caller has already imported bpy.
+    """
+    with open(shape_keys_json_path, 'r') as f:
+        sk_data = json.load(f)
+
+    base = np.asarray(sk_data["base_vertices"], dtype=np.float32)
+    deltas = np.asarray(sk_data["deltas"], dtype=np.float32)
+    values = np.asarray(sk_data.get("values", []), dtype=np.float32)
+    names = sk_data.get("names") or [f"expr_{i:02d}" for i in range(deltas.shape[0])]
+
+    mesh = mesh_obj.data
+    if len(mesh.vertices) != base.shape[0]:
+        log.warning(
+            f" Shape-key vertex count mismatch: mesh has {len(mesh.vertices)} "
+            f"vertices, shape-key data has {base.shape[0]}. Skipping shape keys."
+        )
+        return
+
+    # Match the OBJ flip we did in _write_obj_file: (x, -y, -z).
+    base_bl = base.copy()
+    base_bl[:, 1] = -base_bl[:, 1]
+    base_bl[:, 2] = -base_bl[:, 2]
+    deltas_bl = deltas.copy()
+    deltas_bl[:, :, 1] = -deltas_bl[:, :, 1]
+    deltas_bl[:, :, 2] = -deltas_bl[:, :, 2]
+
+    # Add Basis shape key with the neutral (expr=0) mesh so shape keys are
+    # deltas from a neutral face — otherwise expressions would layer on top
+    # of the already-expressioned mesh from the OBJ import.
+    basis_key = mesh_obj.shape_key_add(name="Basis", from_mix=False)
+    for i in range(base_bl.shape[0]):
+        basis_key.data[i].co = (float(base_bl[i, 0]), float(base_bl[i, 1]), float(base_bl[i, 2]))
+
+    # Create expression shape keys: Basis + delta[i].
+    for i in range(deltas_bl.shape[0]):
+        key_name = f"{name_prefix}{names[i]}" if name_prefix else names[i]
+        key = mesh_obj.shape_key_add(name=key_name, from_mix=False)
+        key.slider_min = -2.0
+        key.slider_max = 2.0
+        for v_idx in range(base_bl.shape[0]):
+            key.data[v_idx].co = (
+                float(base_bl[v_idx, 0] + deltas_bl[i, v_idx, 0]),
+                float(base_bl[v_idx, 1] + deltas_bl[i, v_idx, 1]),
+                float(base_bl[v_idx, 2] + deltas_bl[i, v_idx, 2]),
+            )
+        # Activate to the coefficient the source image had, so the default
+        # imported mesh looks like the original expression.
+        if i < len(values):
+            key.value = float(values[i])
+
+
 class BpyFBXExporter:
     """Isolated bpy-based FBX exporter that runs in the sam3dbody venv."""
 
     FUNCTION = "export"
 
-    def export(self, input_obj_path, output_fbx_path, skeleton_json_path=None, combined_json_path=None):
+    def export(self, input_obj_path, output_fbx_path, skeleton_json_path=None, combined_json_path=None, shape_keys_json_path=None):
         """Export OBJ mesh to FBX using bpy.
 
         If combined_json_path is provided, exports multiple people into a single FBX.
         Otherwise, exports a single person.
+
+        If shape_keys_json_path is provided, adds MHR face-expression shape keys
+        to the mesh before export.
         """
         import bpy
         from mathutils import Vector
@@ -528,6 +703,13 @@ class BpyFBXExporter:
                 bpy.ops.object.parent_set(type='ARMATURE')
             else:
                 bpy.ops.object.parent_set(type='ARMATURE_NAME')
+
+        # Add MHR face-expression shape keys (if requested). This runs BEFORE
+        # the double-sided duplication so that when the duplicated vertices
+        # inherit the Basis shape key positions, the expressions still deform
+        # the back-face copies correctly.
+        if shape_keys_json_path and os.path.exists(shape_keys_json_path):
+            _apply_face_shape_keys_from_json(mesh_obj, shape_keys_json_path)
 
         # Make mesh double-sided AFTER skinning (so duplicated vertices inherit weights)
         bpy.context.view_layer.objects.active = mesh_obj
@@ -992,6 +1174,13 @@ class SAM3DBodyExportFBX(io.ComfyNode):
                             "reinterpret leaned poses — e.g. a leaning-forward kneel becomes an "
                             "upright squat).  Both baked modes also recenter the world bone under "
                             "the character's feet."),
+                io.Boolean.Input("bake_face_shape_keys", default=False,
+                    tooltip="When enabled, adds 72 MHR face-expression shape keys to the mesh so "
+                            "you can edit each blendshape (jaw, brow, lip corners, cheeks, etc.) "
+                            "independently in Blender. Shape keys are initialized to the "
+                            "coefficients detected in the source image, so the default view "
+                            "matches the original expression. Adds ~1 MHR forward pass with 73 "
+                            "batch rows, so exports are noticeably slower."),
             ],
             outputs=[
                 io.String.Output(display_name="fbx_path"),
@@ -999,7 +1188,7 @@ class SAM3DBodyExportFBX(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, mesh_data, output_filename, overwrite=False, bake_facing="off"):
+    def execute(cls, mesh_data, output_filename, overwrite=False, bake_facing="off", bake_face_shape_keys=False):
         """Export mesh with skeleton to FBX format."""
 
         # Extract mesh data
@@ -1034,8 +1223,11 @@ class SAM3DBodyExportFBX(io.ComfyNode):
         # Optional orientation bake — logic is in _apply_bake_facing so it can
         # be shared with the two-character export node (which needs to apply
         # ONE transform to both characters to preserve their spatial relation).
+        # We hold onto (R_used, offset_used) so shape-key baking can apply the
+        # same transform to its base/basis meshes.
+        R_used, offset_used = None, None
         if bake_facing and bake_facing != "off":
-            joint_coords, vertices, _r, _o = _apply_bake_facing(
+            joint_coords, vertices, R_used, offset_used = _apply_bake_facing(
                 joint_coords, vertices, mode=bake_facing)
 
         # Create a simple OBJ file first (Blender can import this easily)
@@ -1158,13 +1350,44 @@ class SAM3DBodyExportFBX(io.ComfyNode):
             with open(skeleton_json_path, 'w') as f:
                 json.dump(skeleton_data, f)
 
+        # Optional face-expression shape keys: run MHR 73 times (base + 72
+        # basis) with the SAME shape+pose but varying expr, then write to a
+        # temp JSON that the bpy exporter turns into Blender shape keys.
+        shape_keys_json_path = None
+        if bake_face_shape_keys:
+            # If bake_facing is "off" here but the mesh_data carries a
+            # _bake_transform (e.g. the two-character export node already ran
+            # the bake with a shared transform), use that so shape-key basis
+            # meshes align with the OBJ vertices.
+            _R_for_sk, _off_for_sk = R_used, offset_used
+            if _R_for_sk is None and _off_for_sk is None:
+                _pre = mesh_data.get('_bake_transform') if isinstance(mesh_data, dict) else None
+                if isinstance(_pre, dict):
+                    _R_for_sk = _pre.get('R')
+                    _off_for_sk = _pre.get('offset')
+            sk_data = _compute_face_shape_key_data(
+                mesh_data, R_mhr=_R_for_sk, offset_mhr=_off_for_sk
+            )
+            if sk_data is not None:
+                shape_keys_json_path = os.path.join(
+                    temp_dir, f"shape_keys_{int(time.time())}.json"
+                )
+                with open(shape_keys_json_path, 'w') as f:
+                    json.dump({
+                        "base_vertices": sk_data["base_vertices"].tolist(),
+                        "deltas": sk_data["deltas"].tolist(),
+                        "values": sk_data["values"].tolist(),
+                        "names": sk_data["names"],
+                    }, f)
+
         try:
             # Use isolated bpy exporter in sam3dbody venv
             exporter = BpyFBXExporter()
             result = exporter.export(
                 input_obj_path=temp_obj_path,
                 output_fbx_path=output_fbx_path,
-                skeleton_json_path=skeleton_json_path
+                skeleton_json_path=skeleton_json_path,
+                shape_keys_json_path=shape_keys_json_path,
             )
 
             if not result.get("success"):
@@ -1181,6 +1404,8 @@ class SAM3DBodyExportFBX(io.ComfyNode):
                 os.unlink(temp_obj_path)
             if skeleton_json_path and os.path.exists(skeleton_json_path):
                 os.unlink(skeleton_json_path)
+            if shape_keys_json_path and os.path.exists(shape_keys_json_path):
+                os.unlink(shape_keys_json_path)
 
     @staticmethod
     def _write_obj_file(filepath, vertices, faces):
@@ -1541,6 +1766,11 @@ class SAM3DBodyExportTwoCharactersFBX(io.ComfyNode):
                 io.Combo.Input("inference_type", options=["full", "body", "hand"],
                     default="full",
                     tooltip="full = body + hand decoders, body = body decoder only, hand = hand only"),
+                io.Boolean.Input("bake_face_shape_keys", default=False,
+                    tooltip="Add 72 MHR face-expression shape keys to each character's mesh so "
+                            "each blendshape can be sculpted independently in Blender. "
+                            "Doubles the MHR forward count (once per character), so exports are "
+                            "noticeably slower."),
             ],
             outputs=[
                 io.String.Output(display_name="fbx_path_a"),
@@ -1555,7 +1785,8 @@ class SAM3DBodyExportTwoCharactersFBX(io.ComfyNode):
                 overwrite=False, bake_facing="off",
                 preserve_scene_positions=True,
                 bbox_threshold=0.8, nms_threshold=0.3,
-                inference_type="full", mask_b=None):
+                inference_type="full", mask_b=None,
+                bake_face_shape_keys=False):
         # Import the process node lazily to avoid a circular import at module load.
         from .process import SAM3DBodyProcessAdvanced
 
@@ -1608,6 +1839,11 @@ class SAM3DBodyExportTwoCharactersFBX(io.ComfyNode):
                     if isinstance(j, torch.Tensor):
                         j = j.cpu().numpy()
                     md["joint_coords"] = j.astype(np.float32) + cam_t
+                # Remember cam_t so shape-key basis meshes (computed later
+                # from raw MHR output) can be shifted by the same amount.
+                # _apply_bake_facing SUBTRACTS offset from vertices, so we
+                # store -cam_t here to undo the addition consistently.
+                md['_bake_transform'] = {'R': None, 'offset': -cam_t}
 
             _apply_cam_t(mesh_a)
             _apply_cam_t(mesh_b)
@@ -1641,6 +1877,12 @@ class SAM3DBodyExportTwoCharactersFBX(io.ComfyNode):
             mesh_a['vertices'] = va
             mesh_b['joint_coords'] = jb
             mesh_b['vertices'] = vb
+            # Stash the shared transform so downstream shape-key baking (which
+            # sees bake_facing="off" and would otherwise assume no transform)
+            # can apply the SAME rotation+offset to the base/basis meshes it
+            # computes from MHR.
+            mesh_a['_bake_transform'] = {'R': R_shared, 'offset': off_shared}
+            mesh_b['_bake_transform'] = {'R': R_shared, 'offset': off_shared}
 
         # Export both with bake_facing=False (the transform, if any, was
         # already applied above with a shared reference).
@@ -1650,6 +1892,7 @@ class SAM3DBodyExportTwoCharactersFBX(io.ComfyNode):
                 output_filename=filename,
                 overwrite=overwrite,
                 bake_facing="off",
+                bake_face_shape_keys=bake_face_shape_keys,
             )
             return out.args[0]
 

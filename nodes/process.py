@@ -497,13 +497,111 @@ class SAM3DBodyProcessAdvanced(io.ComfyNode):
         return img_bgr
 
 
+class SAM3DBodyFaceExpression(io.ComfyNode):
+    """
+    Extract and inspect the 72 MHR face-expression coefficients from a
+    processed SAM 3D Body result.
+
+    The expression vector is the same one used by the built-in
+    SAM3D_FaceExpression ComfyUI node — it drives the MHR blendshape basis
+    (jaw, brows, eyelids, lip corners, cheeks, etc.). Downstream nodes can
+    consume the raw `expression` output; the `summary_json` output is a
+    human-readable JSON string listing the most active coefficients.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SAM3DBodyFaceExpression",
+            display_name="SAM 3D Body: Face Expression",
+            category="SAM3DBody/processing",
+            inputs=[
+                io.Custom("SAM3D_OUTPUT").Input("mesh_data",
+                    tooltip="Mesh data from SAM3D Body Process node"),
+                io.Int.Input("top_k", default=10, min=1, max=72, step=1,
+                    tooltip="How many top-magnitude coefficients to include in summary_json"),
+            ],
+            outputs=[
+                io.Custom("SAM3D_EXPRESSION").Output(display_name="expression"),
+                io.String.Output(display_name="summary_json"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, mesh_data, top_k=10):
+        import json as _json
+
+        expr = None
+        pose_params = mesh_data.get("pose_params") if isinstance(mesh_data, dict) else None
+        if isinstance(pose_params, dict):
+            expr = pose_params.get("expr")
+        if expr is None and isinstance(mesh_data, dict):
+            expr = mesh_data.get("expr_params")
+
+        if expr is None:
+            raise RuntimeError(
+                "No face expression parameters found in mesh_data. "
+                "Ensure the upstream Process node produced a full result."
+            )
+
+        if isinstance(expr, torch.Tensor):
+            expr_np = expr.detach().cpu().float().numpy()
+        else:
+            expr_np = np.asarray(expr, dtype=np.float32)
+        expr_np = expr_np.reshape(-1).astype(np.float32)
+
+        n = int(expr_np.shape[0])
+        k = int(max(1, min(top_k, n)))
+        order = np.argsort(-np.abs(expr_np))[:k]
+
+        # Semantic FACS-style names from Meta's MHR docs — makes the top-N
+        # summary read as `jawDrop / lipCornerPuller_L` instead of numeric
+        # indices. Only used when the coefficient count matches v1.x's 72.
+        names = None
+        try:
+            from .sam_3d_body.mhr_face_expression_names import MHR_FACE_EXPRESSION_NAMES
+            if n == len(MHR_FACE_EXPRESSION_NAMES):
+                names = MHR_FACE_EXPRESSION_NAMES
+        except Exception:
+            pass
+
+        def _name_for(i):
+            return names[i] if names and 0 <= i < len(names) else None
+
+        top = [
+            {
+                "index": int(i),
+                "name": _name_for(int(i)),
+                "value": float(expr_np[i]),
+            }
+            for i in order.tolist()
+        ]
+
+        summary = {
+            "num_coefficients": n,
+            "l2_norm": float(np.linalg.norm(expr_np)),
+            "max_abs": float(np.max(np.abs(expr_np))) if n else 0.0,
+            "top": top,
+        }
+        summary_json = _json.dumps(summary, indent=2)
+
+        expression_out = {
+            "values": expr_np,
+            "num_coefficients": n,
+            "names": list(names) if names else None,
+        }
+        return io.NodeOutput(expression_out, summary_json)
+
+
 # Register nodes
 NODE_CLASS_MAPPINGS = {
     "SAM3DBodyProcess": SAM3DBodyProcess,
     "SAM3DBodyProcessAdvanced": SAM3DBodyProcessAdvanced,
+    "SAM3DBodyFaceExpression": SAM3DBodyFaceExpression,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3DBodyProcess": "SAM 3D Body: Process Image",
     "SAM3DBodyProcessAdvanced": "SAM 3D Body: Process Image (Advanced)",
+    "SAM3DBodyFaceExpression": "SAM 3D Body: Face Expression",
 }

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SAM3D Pose Copy",
     "author": "ComfyUI-SAM3DBody",
-    "version": (4, 0, 2),
+    "version": (4, 1, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > SAM3D",
     "description": "Interactively map bones from a SAM3D-Body MHR posed skeleton onto any target armature.",
@@ -925,6 +925,24 @@ class SAM3DProfile(PropertyGroup):
                      "(target stays at rest orientation)."),
         default=1.0, min=0.0, max=5.0, soft_min=0.5, soft_max=2.5,
         update=_row_updated,
+    )
+    # Shape-key transfer: source is the SAM3D mesh imported from the exported
+    # FBX (has 72 expr_XX shape keys plus Basis); target is any mesh on the
+    # user's Rigify character (topology can differ — the operator uses
+    # Surface Deform bake).
+    face_shape_key_source: PointerProperty(
+        name="Expr source mesh",
+        description="Mesh imported from the SAM3D FBX (with 'expr_00'..'expr_71' shape keys) "
+                    "that provides the face expression blendshapes",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'MESH',
+    )
+    face_shape_key_target: PointerProperty(
+        name="Expr target mesh",
+        description="Mesh on the target character that should receive the transferred shape keys. "
+                    "Topology can differ from the source — transfer uses Surface Deform to bake",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'MESH',
     )
 
 
@@ -2914,6 +2932,149 @@ class SAM3D_OT_pick_from_selected(Operator):
 # Panels
 # -----------------------------------------------------------------------------
 
+class SAM3D_OT_transfer_face_shape_keys(Operator):
+    """Copy all MHR face-expression shape keys from the profile's source mesh
+    onto the target mesh via a Surface Deform bake.
+
+    Works across different topologies (Rigify head ≠ SAM3D head), so the user
+    can sculpt each blendshape (jaw, brow, lip corners, cheeks, etc.) directly
+    on their target character. Existing shape keys on the target with the same
+    name are removed first so re-running gives a clean result."""
+
+    bl_idname = "sam3d.transfer_face_shape_keys"
+    bl_label = "Transfer face shape keys → target mesh"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.sam3d_pose_copy
+        prof = _prof(props)
+        if prof is None:
+            self.report({'ERROR'}, "No active profile.")
+            return {'CANCELLED'}
+
+        src = prof.face_shape_key_source
+        tgt = prof.face_shape_key_target
+        if src is None or tgt is None:
+            self.report({'ERROR'}, "Pick both Expr source and Expr target meshes on this profile.")
+            return {'CANCELLED'}
+        if src.type != 'MESH' or tgt.type != 'MESH':
+            self.report({'ERROR'}, "Expr source and target must both be meshes.")
+            return {'CANCELLED'}
+        if src.data.shape_keys is None or len(src.data.shape_keys.key_blocks) < 2:
+            self.report({'ERROR'}, "Source mesh has no expression shape keys — export the "
+                                    "FBX with 'bake_face_shape_keys' enabled.")
+            return {'CANCELLED'}
+
+        src_keys = src.data.shape_keys
+        # Names to transfer: everything except Basis. Includes the "expr_XX"
+        # keys the exporter writes; also any custom-named keys the user added.
+        source_key_names = [kb.name for kb in src_keys.key_blocks if kb.name != "Basis"]
+        if not source_key_names:
+            self.report({'ERROR'}, "Source mesh only has a Basis key — nothing to transfer.")
+            return {'CANCELLED'}
+
+        # Snapshot source shape-key values so we can restore after transfer.
+        original_values = {kb.name: float(kb.value) for kb in src_keys.key_blocks}
+
+        # Ensure target has a Basis shape key. from_mix=False so it's the
+        # true rest mesh.
+        if tgt.data.shape_keys is None:
+            tgt.shape_key_add(name="Basis", from_mix=False)
+
+        # Add Surface Deform modifier + bind. Bind fails silently on some
+        # meshes (n-gons, non-manifold), so verify the bind succeeded.
+        mod_name = "_SAM3D_ShapeKeyTransfer"
+        # Remove any leftover from a previous attempt.
+        for m in list(tgt.modifiers):
+            if m.name == mod_name:
+                tgt.modifiers.remove(m)
+
+        sd = tgt.modifiers.new(name=mod_name, type='SURFACE_DEFORM')
+        sd.target = src
+
+        # Bind requires the modifier's owner to be the active object.
+        prev_active = context.view_layer.objects.active
+        prev_selected = [o for o in context.selected_objects]
+        try:
+            for o in prev_selected:
+                o.select_set(False)
+            tgt.select_set(True)
+            context.view_layer.objects.active = tgt
+
+            # Zero all source shape keys BEFORE binding so the bind captures
+            # the rest (Basis) geometry — otherwise the "unactivated" state
+            # already carries the source's baked expression.
+            for kb in src_keys.key_blocks:
+                kb.value = 0.0
+            context.view_layer.update()
+
+            bpy.ops.object.surfacedeform_bind(modifier=mod_name)
+            if not sd.is_bound:
+                self.report({'ERROR'}, "Surface Deform bind failed — try increasing 'Interpolation "
+                                        "Falloff' or check the target mesh for non-manifold geometry.")
+                return {'CANCELLED'}
+
+            depsgraph = context.evaluated_depsgraph_get()
+
+            transferred = 0
+            for name in source_key_names:
+                # Activate this expression on the source ONLY.
+                for kb in src_keys.key_blocks:
+                    kb.value = 1.0 if kb.name == name else 0.0
+                context.view_layer.update()
+                depsgraph.update()
+
+                # Evaluate the target mesh with the Surface Deform modifier
+                # applied — this gives us where each vertex ends up under
+                # the current source deformation.
+                eval_obj = tgt.evaluated_get(depsgraph)
+                eval_mesh = eval_obj.to_mesh()
+
+                # Remove any existing shape key with the same name so re-runs
+                # don't accumulate duplicates.
+                if name in tgt.data.shape_keys.key_blocks:
+                    old = tgt.data.shape_keys.key_blocks[name]
+                    tgt.shape_key_remove(old)
+
+                new_key = tgt.shape_key_add(name=name, from_mix=False)
+                new_key.slider_min = -2.0
+                new_key.slider_max = 2.0
+                # Copy evaluated vertex positions into the new key.
+                # to_mesh() returns a mesh whose vertex count == original,
+                # since Surface Deform doesn't add/remove verts.
+                for vi, v in enumerate(eval_mesh.vertices):
+                    new_key.data[vi].co = v.co
+
+                eval_obj.to_mesh_clear()
+                transferred += 1
+
+        finally:
+            # Restore source shape-key values (default to original from
+            # snapshot, else 0).
+            for kb in src_keys.key_blocks:
+                kb.value = original_values.get(kb.name, 0.0)
+            # Remove the transfer modifier — it was scaffolding only.
+            if mod_name in tgt.modifiers:
+                tgt.modifiers.remove(tgt.modifiers[mod_name])
+
+            # Restore selection and active object.
+            for o in context.selected_objects:
+                o.select_set(False)
+            for o in prev_selected:
+                try:
+                    o.select_set(True)
+                except ReferenceError:
+                    pass
+            if prev_active is not None:
+                try:
+                    context.view_layer.objects.active = prev_active
+                except ReferenceError:
+                    pass
+
+        self.report({'INFO'}, f"Transferred {transferred} shape keys from '{src.name}' to '{tgt.name}'.")
+        return {'FINISHED'}
+
+
 class SAM3D_PT_pose_panel(Panel):
     bl_label = "SAM3D Pose Copy"
     bl_idname = "SAM3D_PT_pose_panel"
@@ -3035,6 +3196,17 @@ class SAM3D_PT_pose_panel(Panel):
         row.operator("sam3d.save_preset", icon='FILE_TICK')
         row.operator("sam3d.load_preset", icon='FILEBROWSER')
 
+        # Face expression shape-key transfer
+        box = layout.box()
+        box.label(text="Face expression shape keys", icon='SHAPEKEY_DATA')
+        col = box.column(align=True)
+        col.prop(_prof(props), "face_shape_key_source")
+        col.prop(_prof(props), "face_shape_key_target")
+        row = box.row(align=True)
+        row.operator("sam3d.transfer_face_shape_keys",
+                     icon='SHAPEKEY_DATA',
+                     text="Transfer to target mesh")
+
         # IK pole targets (populated by auto-match or manually)
         box = layout.box()
         box.label(text="IK pole targets", icon='EMPTY_SINGLE_ARROW')
@@ -3115,6 +3287,7 @@ classes = (
     SAM3D_OT_copy_all,
     SAM3D_OT_dump_bones,
     SAM3D_OT_pick_from_selected,
+    SAM3D_OT_transfer_face_shape_keys,
     SAM3D_PT_pose_panel,
 )
 
