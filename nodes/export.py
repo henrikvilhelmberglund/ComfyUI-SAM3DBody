@@ -115,6 +115,75 @@ def _align_torso_rolls_from_landmarks(bones_dict, rel_joints_corrected, joint_na
             sb.align_roll(forward)
 
 
+def _align_limb_rolls_from_landmarks(bones_dict, rel_joints_corrected, joint_names_list, name_prefix=""):
+    """Align limb bone rolls (arms, legs, clavicles) to a character-relative
+    axis convention so their local Z-axis points along character-forward, the
+    same convention CloudRig / Rigify use.
+
+    Without this, Blender's FBX importer picks whatever roll it likes per bone,
+    which forces retargeters to use DELTA mode or per-bone rotation offsets.
+    With this, source and target bones share axes and FULL-mode retargeting
+    works cleanly.
+
+    Fingers, hand internals (twist procs, wrist twist), toes, and the
+    subtalar/ball chain are intentionally skipped:
+    - Fingers point roughly ALONG the character-forward axis at rest so
+      align_roll(forward) becomes degenerate; users typically transfer fingers
+      with DELTA anyway.
+    - Twist proc bones exist purely to distribute skinning weight and are
+      never retargeted directly.
+
+    Runs in EDIT mode, after the torso alignment. `name_prefix` supports the
+    multi-person exporter which prefixes bones with "P{idx}_".
+    """
+    from mathutils import Vector
+    name_to_idx = {n: i for i, n in enumerate(joint_names_list)}
+    try:
+        l_upleg = Vector(rel_joints_corrected[name_to_idx['l_upleg']])
+        r_upleg = Vector(rel_joints_corrected[name_to_idx['r_upleg']])
+        root = Vector(rel_joints_corrected[name_to_idx['root']])
+        c_head = Vector(rel_joints_corrected[name_to_idx['c_head']])
+    except (KeyError, IndexError):
+        return
+
+    right = r_upleg - l_upleg
+    up = c_head - root
+    if right.length < 1e-4 or up.length < 1e-4:
+        return
+    right.normalize(); up.normalize()
+    forward = right.cross(up)
+    if forward.length < 1e-4:
+        return
+    forward.normalize()
+
+    # All main-body chain bones. Roll them to character-forward. align_roll is
+    # a no-op if bone Y is parallel to `forward`; for these bones it never is
+    # (arms point down/out, legs point down, clavicles point sideways — all
+    # roughly perpendicular to forward).
+    limb_bones = (
+        # Arms
+        'l_clavicle', 'l_uparm', 'l_lowarm', 'l_wrist',
+        'r_clavicle', 'r_uparm', 'r_lowarm', 'r_wrist',
+        # Legs — include the ankle/foot chain so foot-IK transfer with FULL
+        # gets a consistent local frame.
+        'l_upleg', 'l_lowleg', 'l_foot',
+        'r_upleg', 'r_lowleg', 'r_foot',
+    )
+    for bn in limb_bones:
+        bone = bones_dict.get(name_prefix + bn)
+        if bone is None:
+            continue
+        # Skip if the bone's Y direction is nearly parallel to `forward`
+        # (would make align_roll unstable).
+        y = (Vector(bone.tail) - Vector(bone.head))
+        if y.length < 1e-4:
+            continue
+        y.normalize()
+        if abs(y.dot(forward)) > 0.98:
+            continue
+        bone.align_roll(forward)
+
+
 # Blender/MHR coord flip used by both bake helpers: (x, y, z) → (x, z, -y).
 _BAKE_T = np.array([[1.0, 0.0, 0.0],
                     [0.0, 0.0, 1.0],
@@ -131,13 +200,48 @@ def _compute_yaw_only_transform(joint_coords):
         _idx = {n: i for i, n in enumerate(_MJN)}
         _to_bl = lambda p: (_BAKE_T @ p.astype(np.float32))
 
-        # Character forward in Blender coords, from hip axis × spine, then
-        # flatten to the horizontal plane (yaw only).
-        right_bl = _to_bl(joint_coords[_idx['r_upleg']]
-                          - joint_coords[_idx['l_upleg']])
         up_bl = _to_bl(joint_coords[_idx['c_head']]
                        - joint_coords[_idx['root']])
-        forward_bl = np.cross(up_bl, right_bl)
+        un = float(np.linalg.norm(up_bl))
+        if un < 1e-4:
+            return None
+        up_bl = up_bl / un
+
+        # Character forward from eye anatomy (matches _compute_bake_facing_transform)
+        # so YAW and FULL agree on which side of the character is "front". The
+        # geometric hip×spine cross product is 180° ambiguous in MHR (points at
+        # the back for the default output orientation), which produced a
+        # backwards-facing character before this fix.
+        forward_bl = None
+        try:
+            _le = _to_bl(joint_coords[_idx['l_eye']])
+            _re = _to_bl(joint_coords[_idx['r_eye']])
+            _hd = _to_bl(joint_coords[_idx['c_head']])
+            _f_eye = (_le + _re) * 0.5 - _hd
+            # Project out the vertical component so we get a pure yaw axis.
+            _f_eye = _f_eye - up_bl * float(np.dot(_f_eye, up_bl))
+            _fen = float(np.linalg.norm(_f_eye))
+            if _fen > 1e-4:
+                forward_bl = _f_eye / _fen
+        except (KeyError, IndexError):
+            pass
+
+        if forward_bl is None:
+            # Fallback: hip axis × spine. Sign chosen to match FULL's eye-based
+            # convention (up × right, then negate — right × up gives -forward
+            # for MHR's default character orientation).
+            right_bl = _to_bl(joint_coords[_idx['r_upleg']]
+                              - joint_coords[_idx['l_upleg']])
+            rn = float(np.linalg.norm(right_bl))
+            if rn < 1e-4:
+                return None
+            right_bl /= rn
+            forward_bl = np.cross(up_bl, right_bl)
+            fn = float(np.linalg.norm(forward_bl))
+            if fn < 1e-4:
+                return None
+            forward_bl /= fn
+
         forward_xy = np.array([forward_bl[0], forward_bl[1], 0.0],
                               dtype=np.float32)
         n = float(np.linalg.norm(forward_xy))
@@ -509,6 +613,7 @@ class BpyFBXExporter:
             skinning_weights = skeleton_data.get('skinning_weights')
             global_rotations_data = skeleton_data.get('global_rotations')
             joint_names_list = skeleton_data.get('joint_names')
+            align_all_rolls_flag = bool(skeleton_data.get('align_all_rolls', False))
 
             if joint_positions:
                 joints = np.array(joint_positions, dtype=np.float32)
@@ -662,6 +767,10 @@ class BpyFBXExporter:
             # and any full/roll-preserving retarget picks up random twist.
             if use_named:
                 _align_torso_rolls_from_landmarks(bones_dict, rel_joints_corrected, joint_names_list)
+                # Opt-in: also align limb bones (arms/legs/clavicles) so
+                # CloudRig/Rigify FULL-mode retargeting works cleanly.
+                if align_all_rolls_flag:
+                    _align_limb_rolls_from_landmarks(bones_dict, rel_joints_corrected, joint_names_list)
 
             # Switch to object mode
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -805,6 +914,7 @@ class BpyFBXExporter:
                 skinning_weights = skeleton_data.get('skinning_weights')
                 global_rotations_data = skeleton_data.get('global_rotations')
                 joint_names_list = skeleton_data.get('joint_names')
+                align_all_rolls_flag = bool(skeleton_data.get('align_all_rolls', False))
 
                 if joint_positions:
                     joints = np.array(joint_positions, dtype=np.float32)
@@ -928,6 +1038,11 @@ class BpyFBXExporter:
                         bones_dict, rel_joints_corrected, joint_names_list,
                         name_prefix=f'P{idx}_',
                     )
+                    if align_all_rolls_flag:
+                        _align_limb_rolls_from_landmarks(
+                            bones_dict, rel_joints_corrected, joint_names_list,
+                            name_prefix=f'P{idx}_',
+                        )
 
                 # Switch to object mode
                 bpy.ops.object.mode_set(mode='OBJECT')
@@ -1181,6 +1296,14 @@ class SAM3DBodyExportFBX(io.ComfyNode):
                             "coefficients detected in the source image, so the default view "
                             "matches the original expression. Adds ~1 MHR forward pass with 73 "
                             "batch rows, so exports are noticeably slower."),
+                io.Boolean.Input("align_all_rolls", default=False,
+                    tooltip="When enabled, aligns limb bone rolls (arms/legs/clavicles) to "
+                            "the same character-forward convention CloudRig / Rigify use "
+                            "(the torso chain already gets this). Lets retargeters use FULL "
+                            "mode on limbs without twist artefacts, so you don't need per-bone "
+                            "rotation offsets. Leave off if you already have presets tuned to "
+                            "the default rolls — enabling this will slightly change their DELTA "
+                            "output on limb bones."),
             ],
             outputs=[
                 io.String.Output(display_name="fbx_path"),
@@ -1188,7 +1311,8 @@ class SAM3DBodyExportFBX(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, mesh_data, output_filename, overwrite=False, bake_facing="off", bake_face_shape_keys=False):
+    def execute(cls, mesh_data, output_filename, overwrite=False, bake_facing="off",
+                bake_face_shape_keys=False, align_all_rolls=False):
         """Export mesh with skeleton to FBX format."""
 
         # Extract mesh data
@@ -1265,6 +1389,7 @@ class SAM3DBodyExportFBX(io.ComfyNode):
                 "num_joints": len(joint_coords),
                 "mesh_vertices_bounds_min": mesh_min,
                 "mesh_vertices_bounds_max": mesh_max,
+                "align_all_rolls": bool(align_all_rolls),
             }
 
             if len(joint_coords) == 127:
@@ -1771,6 +1896,10 @@ class SAM3DBodyExportTwoCharactersFBX(io.ComfyNode):
                             "each blendshape can be sculpted independently in Blender. "
                             "Doubles the MHR forward count (once per character), so exports are "
                             "noticeably slower."),
+                io.Boolean.Input("align_all_rolls", default=False,
+                    tooltip="Align limb bone rolls (arms/legs/clavicles) to the character-forward "
+                            "convention CloudRig / Rigify use, so retargeting can use FULL mode "
+                            "without per-bone rotation offsets."),
             ],
             outputs=[
                 io.String.Output(display_name="fbx_path_a"),
@@ -1786,7 +1915,8 @@ class SAM3DBodyExportTwoCharactersFBX(io.ComfyNode):
                 preserve_scene_positions=True,
                 bbox_threshold=0.8, nms_threshold=0.3,
                 inference_type="full", mask_b=None,
-                bake_face_shape_keys=False):
+                bake_face_shape_keys=False,
+                align_all_rolls=False):
         # Import the process node lazily to avoid a circular import at module load.
         from .process import SAM3DBodyProcessAdvanced
 
@@ -1893,6 +2023,7 @@ class SAM3DBodyExportTwoCharactersFBX(io.ComfyNode):
                 overwrite=overwrite,
                 bake_facing="off",
                 bake_face_shape_keys=bake_face_shape_keys,
+                align_all_rolls=align_all_rolls,
             )
             return out.args[0]
 

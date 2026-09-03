@@ -1,0 +1,84 @@
+[
+  {"source": "world",       "target": "root",                    "enabled": true, "mode": "POS",   "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "root",        "target": "FK-Hips",                 "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "c_spine0",    "target": "FK-Spine",                "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "c_spine1",    "target": "",                        "enabled": false, "mode": "SKIP",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "c_spine2",    "target": "",                        "enabled": false, "mode": "SKIP",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "c_spine3",    "target": "FK-Chest",                "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "c_neck",      "target": "FK-Neck",                 "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "c_head",      "target": "FK-Head",                 "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "c_jaw",       "target": "Jaw",                     "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_eye",       "target": "Eye.L",                   "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_eye",       "target": "Eye.R",                   "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "l_clavicle",  "target": "FK-Shoulder.L",           "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_uparm",     "target": "FK-UpperArm.L",           "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_lowarm",    "target": "FK-Forearm.L",            "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_wrist",     "target": "IK-Hand.L",               "enabled": true, "mode": "POS",   "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_wrist",     "target": "FK-Hand.L",               "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "r_clavicle",  "target": "FK-Shoulder.R",           "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_uparm",     "target": "FK-UpperArm.R",           "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_lowarm",    "target": "FK-Forearm.R",            "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_wrist",     "target": "IK-Hand.R",               "enabled": true, "mode": "POS",   "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_wrist",     "target": "FK-Hand.R",               "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "l_upleg",     "target": "FK-Thigh.L",              "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_lowleg",    "target": "FK-Knee.L",               "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_subtalar",  "target": "IK-Foot.L",               "enabled": true, "mode": "POS",   "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_foot",      "target": "FK-Foot.L",               "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_ball",      "target": "FK-Toes.L",               "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "r_upleg",     "target": "FK-Thigh.R",              "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_lowleg",    "target": "FK-Knee.R",               "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_subtalar",  "target": "IK-Foot.R",               "enabled": true, "mode": "POS",   "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_foot",      "target": "FK-Foot.R",               "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_ball",      "target": "FK-Toes.R",               "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "l_thumb0",    "target": "Finger_Thumb1.L",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_thumb1",    "target": "Finger_Thumb2.L",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_thumb2",    "target": "Finger_Thumb3.L",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_thumb3",    "target": "Finger_Thumb4.L",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "l_index1",    "target": "Finger_Index1.L",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_index2",    "target": "Finger_Index2.L",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_index3",    "target": "Finger_Index3.L",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "l_middle1",   "target": "Finger_Middle1.L",        "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_middle2",   "target": "Finger_Middle2.L",        "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_middle3",   "target": "Finger_Middle3.L",        "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "l_ring1",     "target": "Finger_Ring1.L",          "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_ring2",     "target": "Finger_Ring2.L",          "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_ring3",     "target": "Finger_Ring3.L",          "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "l_pinky0",    "target": "Finger_Pinky_Carpal.L",   "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_pinky1",    "target": "Finger_Pinky1.L",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_pinky2",    "target": "Finger_Pinky2.L",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "l_pinky3",    "target": "Finger_Pinky3.L",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "r_thumb0",    "target": "Finger_Thumb1.R",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_thumb1",    "target": "Finger_Thumb2.R",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_thumb2",    "target": "Finger_Thumb3.R",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_thumb3",    "target": "Finger_Thumb4.R",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "r_index1",    "target": "Finger_Index1.R",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_index2",    "target": "Finger_Index2.R",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_index3",    "target": "Finger_Index3.R",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "r_middle1",   "target": "Finger_Middle1.R",        "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_middle2",   "target": "Finger_Middle2.R",        "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_middle3",   "target": "Finger_Middle3.R",        "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "r_ring1",     "target": "Finger_Ring1.R",          "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_ring2",     "target": "Finger_Ring2.R",          "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_ring3",     "target": "Finger_Ring3.R",          "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+
+  {"source": "r_pinky0",    "target": "Finger_Pinky_Carpal.R",   "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_pinky1",    "target": "Finger_Pinky1.R",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_pinky2",    "target": "Finger_Pinky2.R",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]},
+  {"source": "r_pinky3",    "target": "Finger_Pinky3.R",         "enabled": true, "mode": "FULL",  "flip_z": false, "rotation_offset": [0, 0, 0]}
+]

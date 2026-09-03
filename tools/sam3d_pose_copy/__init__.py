@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SAM3D Pose Copy",
     "author": "ComfyUI-SAM3DBody",
-    "version": (4, 1, 0),
+    "version": (4, 6, 4),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > SAM3D",
     "description": "Interactively map bones from a SAM3D-Body MHR posed skeleton onto any target armature.",
@@ -119,6 +119,135 @@ MHR_TARGET_SYNONYMS = {
 
 # Rigify Human metarig default mapping. Load it via the "Load Rigify preset"
 # button to seed the mapping list, then edit rows to suit your rig.
+# (source_bone, target_bone, mode). Sintel-style CloudRig control names —
+# built from a rig generated from the CloudRig Sintel metarig sample.
+#
+# Mode selection is intentional per bone type:
+#   DELTA    — for torso bones (spine, neck, head, jaw, eyes). DELTA uses a
+#              fixed "character-forward" canonical that lines up with these
+#              bones' natural Y-up rest orientation.
+#   AIM_ROLL — for limb bones (clavicles, arms, legs, feet, FK-Hand). AIM_ROLL
+#              aims the target's Y-axis at the source's Y direction and copies
+#              twist around Y, so it works regardless of rest-axis conventions
+#              between MHR and CloudRig. DELTA does NOT work for limbs because
+#              their rest Y isn't the vertical canonical DELTA assumes.
+#   FINGER   — for fingers. Dedicated palm-normal anatomical frame transfer
+#              (same idea as hand-IK) — convention-invariant and carries
+#              finger curl properly. Plain AIM/AIM_ROLL would only match Y
+#              direction and miss the curl.
+#   POS      — for IK end effectors (IK-Hand, IK-Foot) and the world root.
+#              Position-only with chain-scaled proportions.
+SINTEL_DEFAULT_MAPPING = [
+    # Ground master + torso
+    ("world",      "root",                  "POS"),
+    ("root",       "TORSO-Spine",           "DELTA"),
+
+    # Spine chain — Sintel FK is only 3-tier so we skip the middle MHR bones.
+    # Bump the "Spine bend amplify" slider if target ends up straighter than
+    # source, or manually target c_spine1/c_spine2 at intermediate helpers.
+    ("c_spine0",   "FK-Spine",              "DELTA"),
+    ("c_spine1",   "",                      "SKIP"),
+    ("c_spine2",   "",                      "SKIP"),
+    ("c_spine3",   "FK-Chest",              "DELTA"),
+
+    # Neck / head / face
+    # Plain AIM (not AIM_ROLL) for neck/head because the AIM_ROLL twist match
+    # picks the wrong sign of rotation around Y when source/target X-axes are
+    # on opposite sides of Y (which happens with Sintel FK-Head vs MHR c_head),
+    # producing an upside-down + backward face. AIM carries head tilt/nod
+    # correctly and skips the head-yaw twist. Enable AIM_ROLL manually if you
+    # need head-turn transfer and know how to add a per-row rotation offset
+    # to correct the twist sign.
+    # c_neck targets -Y because Sintel's FK-Neck rest Y sits on the opposite
+    # side of the aim direction MHR c_neck expects — plain +Y/+Y makes the
+    # neck tilt away from the source's direction. -Y flips the aim to match.
+    ("c_neck",     "FK-Neck",               "AIM", "+Y", "-Y"),
+    ("c_head",     "FK-Head",               "AIM"),
+    ("c_jaw",      "Jaw",                   "AIM"),
+    ("l_eye",      "Eye.L",                 "AIM"),
+    ("r_eye",      "Eye.R",                 "AIM"),
+
+    # Left arm
+    ("l_clavicle", "FK-Shoulder.L",         "AIM_ROLL"),
+    ("l_uparm",    "FK-UpperArm.L",         "AIM_ROLL"),
+    ("l_lowarm",   "FK-Forearm.L",          "AIM_ROLL"),
+    ("l_wrist",    "IK-Hand.L",             "POS"),
+    ("l_wrist",    "FK-Hand.L",             "AIM_ROLL"),
+
+    # Right arm
+    ("r_clavicle", "FK-Shoulder.R",         "AIM_ROLL"),
+    ("r_uparm",    "FK-UpperArm.R",         "AIM_ROLL"),
+    ("r_lowarm",   "FK-Forearm.R",          "AIM_ROLL"),
+    ("r_wrist",    "IK-Hand.R",             "POS"),
+    ("r_wrist",    "FK-Hand.R",             "AIM_ROLL"),
+
+    # Left leg — subtalar (below ankle) drives IK for correct heel height.
+    # FK-Foot uses l_ball as the aim source (not l_foot / l_subtalar) because
+    # MHR l_foot's Y-axis is overridden to point at subtalar (down), which
+    # doesn't match Sintel's forward-pointing FK-Foot Y convention. l_ball
+    # gives a ball-to-toe-tip direction closer to Sintel's foot Y.
+    #
+    # Toes intentionally left on SKIP: MHR l_ball is a LEAF bone whose Y axis
+    # is a synthetic extension of midfoot-to-ball rather than a real toe
+    # direction, and SAM3D doesn't reconstruct meaningful toe articulation
+    # from monocular images anyway — aim-based toe transfer just adds noise.
+    # Enable manually if your source really has per-toe motion.
+    ("l_upleg",    "FK-Thigh.L",            "AIM_ROLL"),
+    ("l_lowleg",   "FK-Knee.L",             "AIM_ROLL"),
+    ("l_subtalar", "IK-Foot.L",             "POS"),
+    ("l_ball",     "FK-Foot.L",             "AIM_ROLL"),
+    ("l_ball",     "FK-Toes.L",             "SKIP"),
+
+    # Right leg
+    ("r_upleg",    "FK-Thigh.R",            "AIM_ROLL"),
+    ("r_lowleg",   "FK-Knee.R",             "AIM_ROLL"),
+    ("r_subtalar", "IK-Foot.R",             "POS"),
+    ("r_ball",     "FK-Foot.R",             "AIM_ROLL"),
+    ("r_ball",     "FK-Toes.R",             "SKIP"),
+
+    # Fingers — AIM (no _ROLL) because finger-twist transfer is jittery in
+    # practice and rarely worth having. Sintel has 4 phalanges per finger;
+    # MHR only tracks 3 for index/middle/ring so Finger_XN4 stays unmapped
+    # for those. Thumb has 4 in both (thumb0..3 → Thumb1..4). Pinky has a
+    # carpal (pinky0) that maps to Finger_Pinky_Carpal.
+    ("l_thumb0",   "Finger_Thumb1.L",       "FINGER"),
+    ("l_thumb1",   "Finger_Thumb2.L",       "FINGER"),
+    ("l_thumb2",   "Finger_Thumb3.L",       "FINGER"),
+    ("l_thumb3",   "Finger_Thumb4.L",       "FINGER"),
+    ("l_index1",   "Finger_Index1.L",       "FINGER"),
+    ("l_index2",   "Finger_Index2.L",       "FINGER"),
+    ("l_index3",   "Finger_Index3.L",       "FINGER"),
+    ("l_middle1",  "Finger_Middle1.L",      "FINGER"),
+    ("l_middle2",  "Finger_Middle2.L",      "FINGER"),
+    ("l_middle3",  "Finger_Middle3.L",      "FINGER"),
+    ("l_ring1",    "Finger_Ring1.L",        "FINGER"),
+    ("l_ring2",    "Finger_Ring2.L",        "FINGER"),
+    ("l_ring3",    "Finger_Ring3.L",        "FINGER"),
+    ("l_pinky0",   "Finger_Pinky_Carpal.L", "FINGER"),
+    ("l_pinky1",   "Finger_Pinky1.L",       "FINGER"),
+    ("l_pinky2",   "Finger_Pinky2.L",       "FINGER"),
+    ("l_pinky3",   "Finger_Pinky3.L",       "FINGER"),
+
+    ("r_thumb0",   "Finger_Thumb1.R",       "FINGER"),
+    ("r_thumb1",   "Finger_Thumb2.R",       "FINGER"),
+    ("r_thumb2",   "Finger_Thumb3.R",       "FINGER"),
+    ("r_thumb3",   "Finger_Thumb4.R",       "FINGER"),
+    ("r_index1",   "Finger_Index1.R",       "FINGER"),
+    ("r_index2",   "Finger_Index2.R",       "FINGER"),
+    ("r_index3",   "Finger_Index3.R",       "FINGER"),
+    ("r_middle1",  "Finger_Middle1.R",      "FINGER"),
+    ("r_middle2",  "Finger_Middle2.R",      "FINGER"),
+    ("r_middle3",  "Finger_Middle3.R",      "FINGER"),
+    ("r_ring1",    "Finger_Ring1.R",        "FINGER"),
+    ("r_ring2",    "Finger_Ring2.R",        "FINGER"),
+    ("r_ring3",    "Finger_Ring3.R",        "FINGER"),
+    ("r_pinky0",   "Finger_Pinky_Carpal.R", "FINGER"),
+    ("r_pinky1",   "Finger_Pinky1.R",       "FINGER"),
+    ("r_pinky2",   "Finger_Pinky2.R",       "FINGER"),
+    ("r_pinky3",   "Finger_Pinky3.R",       "FINGER"),
+]
+
+
 RIGIFY_DEFAULT_MAPPING = [
     # Ground master + pelvis
     ("world",      "root"),          # MHR world (ground) -> Rigify ground master
@@ -268,19 +397,20 @@ def _sort_mappings_by_source_order(props, src):
         return (bone_order.get(m.source_bone, unknown_offset), m.target_bone)
 
     # Snapshot current data
-    snapshot = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.flip_z) for m in _prof(props).mappings]
+    snapshot = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.source_axis, m.target_axis) for m in _prof(props).mappings]
     snapshot.sort(key=lambda t: (bone_order.get(t[0], unknown_offset), t[1] or ""))
 
     # Rewrite in place
     with _bulk_mode():
         _prof(props).mappings.clear()
-        for s, t, en, mode, fz in snapshot:
+        for s, t, en, mode, sa, ta in snapshot:
             item = _prof(props).mappings.add()
             item.source_bone = s
             item.target_bone = t
             item.enabled = en
             item.mode = mode
-            item.flip_z = fz
+            item.source_axis = sa
+            item.target_axis = ta
 
 
 # Source triplets used to compute each pole. Order: shoulder/hip, elbow/knee, wrist/ankle.
@@ -310,10 +440,15 @@ class _bulk_mode:
 
 
 def _row_updated(self, context):
-    """Update callback on mapping-row fields. Re-runs the single-row copy
-    so the user sees the effect immediately after picking a bone / toggling.
-    Resets the target bone's pose first so changing mode gives a fresh result
-    rather than stacking on top of the previous copy."""
+    """Update callback on mapping-row fields. Re-runs the FULL copy (all
+    enabled rows) so the interactive edit gives the same visual result as
+    clicking Copy All. A single-row copy would use rest-pose parents for the
+    row's ancestors, which produces a wrong-context intermediate result when
+    other rows (torso, hip, hand) haven't been applied yet.
+
+    Costs one full pose evaluation per field change — cheap enough at 60-100
+    rows to feel instant. If it becomes a bottleneck, the user can turn off
+    the "Live update" toggle."""
     global _LIVE_COPY_LOCK
     if _LIVE_COPY_LOCK or _BULK_EDIT:
         return
@@ -324,32 +459,57 @@ def _row_updated(self, context):
     dst = _prof(props).target_armature
     if src is None or dst is None or src == dst:
         return
-    if not (self.enabled and self.source_bone and self.target_bone):
-        return
     _LIVE_COPY_LOCK = True
     try:
-        # Reset this specific target bone before re-copying so mode changes
-        # don't layer on top of the previous copy's rotation/translation.
-        # SKIP mode preserves whatever the user has done manually.
-        if self.mode != 'SKIP':
-            tgt_pb = dst.pose.bones.get(self.target_bone)
-            if tgt_pb is not None:
-                tgt_pb.matrix_basis = Matrix.Identity(4)
-                bpy.context.view_layer.update()
-        _copy_pose(src, dst,
-                   [(self.source_bone, self.target_bone, True, self.mode, self.flip_z)],
-                   False, False,
+        entries = [
+            (m.source_bone, m.target_bone, m.enabled, m.mode,
+             m.source_axis, m.target_axis)
+            for m in _prof(props).mappings
+        ]
+        _copy_pose(src, dst, entries,
+                   props.position_only,
+                   props.reset_before_copy,
                    lambda *a, **k: None,
-                   compute_poles=False)
+                   compute_poles=True)
     finally:
         _LIVE_COPY_LOCK = False
 
 
+_AXIS_INDEX = {'X': 0, 'Y': 1, 'Z': 2}
+
+
+def _axis_vec_from_matrix(mat, axis_str):
+    """Extract a signed local-axis vector from a 4x4 matrix's rotation
+    columns. axis_str is one of '+X', '-X', '+Y', '-Y', '+Z', '-Z'.
+
+    Returns a 3D Vector (not normalized)."""
+    letter = axis_str[1] if len(axis_str) == 2 else axis_str[0]
+    idx = _AXIS_INDEX.get(letter.upper(), 1)
+    v = mat.col[idx].to_3d()
+    if axis_str.startswith('-'):
+        v = -v
+    return v
+
+
+def _perp_axis_letter(axis_str):
+    """Pick a canonical axis LETTER perpendicular to the given one, used as
+    the 'roll reference' for AIM_ROLL twist matching. Cyclic:
+        aim Y → reference X
+        aim X → reference Y
+        aim Z → reference X (X and Z rows both use X as reference since Y
+                             would collide with the natural along-bone axis)
+    Sign is ignored — the twist calculation projects into a plane and doesn't
+    care about the sign of the reference axis."""
+    letter = axis_str[1] if len(axis_str) == 2 else axis_str[0]
+    return {'X': 'Y', 'Y': 'X', 'Z': 'X'}.get(letter.upper(), 'X')
+
+
 def _copy_pose(src, dst, entries, global_position_only, reset_first, report, compute_poles=True):
-    """Copy pose from src to dst. `entries` is a list of (source_bone, target_bone, enabled, mode, flip_z).
-    mode is one of 'FULL', 'AIM', 'AIM_ROLL', 'DELTA', 'POS'.
-    flip_z applies a 180° rotation around the target bone's Y-axis after the copy,
-    to correct for source/target Z-axis convention mismatches.
+    """Copy pose from src to dst. `entries` is a list of 6-tuples describing
+    each row: (source_bone, target_bone, enabled, mode, src_axis, tgt_axis).
+    src_axis and tgt_axis are strings like '+Y', '-Y', '+X' etc — used by
+    AIM / AIM_ROLL to pick which axes to align.
+    mode is one of 'FULL', 'AIM', 'AIM_ROLL', 'DELTA', 'FINGER', 'POS', 'POS_RAW'.
     global_position_only forces POS mode for all rows.
     reset_first: if True, clears target pose (matrix_basis = identity) before applying."""
     if src is None or dst is None:
@@ -359,27 +519,35 @@ def _copy_pose(src, dst, entries, global_position_only, reset_first, report, com
         report({'ERROR'}, "Source and target must be different armatures.")
         return 0, [], []
 
-    # Backwards-compat: entries may be 4-tuples (old) or 5-tuples (new).
+    # Backwards-compat: entries may be 4-, 5-, 6-, or 7-tuples. Legacy 5/7
+    # forms carried a flip_z bool that is now dropped (replaced by the axis
+    # dropdowns), so discard it on load.
     def _unpack(e):
-        if len(e) == 5:
+        if len(e) == 6:
             return e
+        if len(e) == 7:
+            s, t, en, m, _fz, sa, ta = e
+            return (s, t, en, m, sa, ta)
+        if len(e) == 5:
+            s, t, en, m, _fz = e
+            return (s, t, en, m, '+Y', '+Y')
         s, t, en, m = e
-        return (s, t, en, m, False)
+        return (s, t, en, m, '+Y', '+Y')
     entries = [_unpack(e) for e in entries]
 
-    active = [(s, t, m, fz) for (s, t, en, m, fz) in entries if en and s and t and m != 'SKIP']
+    active = [(s, t, m, sa, ta) for (s, t, en, m, sa, ta) in entries
+              if en and s and t and m != 'SKIP']
     if not active:
         report({'WARNING'}, "No enabled mappings.")
         return 0, [], []
 
-    # Snapshot source world matrices; also remember mode + flip_z per target,
-    # plus source's bone-local pose delta (matrix_basis.to_quaternion()) for
-    # POS-mode IK targets that want to transfer rotation in the bone's own
-    # local frame instead of in world space.
+    # Snapshot source world matrices; also remember per-target settings
+    # (mode, source axis, target axis, source bone name, and source's
+    # bone-local pose delta for POS-mode IK bone-local rotation fallback).
     src_world = src.matrix_world
-    per_target = {}  # target_name -> (world_matrix, local_delta_q, mode, flip_z, source_bone_name)
+    per_target = {}  # target_name -> (world_matrix, local_delta_q, mode, source_bone_name, src_axis, tgt_axis)
     missing_source = []
-    for source_bone, target_bone, row_mode, row_flip_z in active:
+    for source_bone, target_bone, row_mode, row_src_axis, row_tgt_axis in active:
         pb = src.pose.bones.get(source_bone)
         if pb is None:
             missing_source.append(source_bone)
@@ -388,8 +556,9 @@ def _copy_pose(src, dst, entries, global_position_only, reset_first, report, com
             src_world @ pb.matrix,
             pb.matrix_basis.to_3x3().to_quaternion(),
             row_mode,
-            row_flip_z,
             source_bone,
+            row_src_axis,
+            row_tgt_axis,
         )
 
     # Fetch props once — needed by chain-scaled IK positioning inside the
@@ -411,7 +580,7 @@ def _copy_pose(src, dst, entries, global_position_only, reset_first, report, com
     # Bones on rows with mode SKIP are preserved so the user can manually
     # pose them and have it survive re-copies.
     if reset_first:
-        skip_names = {t for (s, t, en, m, fz) in entries if en and t and m == 'SKIP'}
+        skip_names = {t for (s, t, en, m, sa, ta) in entries if en and t and m == 'SKIP'}
         for pb in dst.pose.bones:
             if pb.name in skip_names:
                 continue
@@ -447,22 +616,20 @@ def _copy_pose(src, dst, entries, global_position_only, reset_first, report, com
         pass
 
     # Re-snapshot after any reset.
-    for source_bone, target_bone, row_mode, row_flip_z in active:
+    for source_bone, target_bone, row_mode, row_src_axis, row_tgt_axis in active:
         pb = src.pose.bones.get(source_bone)
         if pb is not None:
             per_target[target_bone] = (
                 src_world @ pb.matrix,
                 pb.matrix_basis.to_3x3().to_quaternion(),
                 row_mode,
-                row_flip_z,
                 source_bone,
+                row_src_axis,
+                row_tgt_axis,
             )
 
-    # 180° rotation around Y in local bone space, used when flip_z is set to
-    # correct source/target Z-axis convention mismatches.
     from mathutils import Matrix as _M
     import math as _math
-    _flip_y_180 = _M.Rotation(_math.pi, 4, 'Y')
 
     # Per-row rotation offsets, indexed by target bone name for O(1) lookup
     # in the loop below.
@@ -518,7 +685,8 @@ def _copy_pose(src, dst, entries, global_position_only, reset_first, report, com
     # a mapped bone in whatever mode it's in. Used by both copy passes so the
     # per-mode logic isn't duplicated.
     def _compute_new_matrix(pb, entry, parent_world):
-        target_world, src_local_delta_q, row_mode, row_flip_z, source_bone = entry
+        (target_world, src_local_delta_q, row_mode, source_bone,
+         row_src_axis, row_tgt_axis) = entry
         if global_position_only:
             row_mode = 'POS'
         new_local = dst_world_inv @ target_world
@@ -634,45 +802,55 @@ def _copy_pose(src, dst, entries, global_position_only, reset_first, report, com
                 new_matrix = dst_world_inv @ new_world
                 new_matrix.translation = _attached_local_trans()
         elif row_mode in ('AIM', 'AIM_ROLL'):
-            # Aim target Y-axis at source Y-axis. For AIM_ROLL, also transfer the
-            # source's twist around Y so head/spine/pelvis facing is preserved.
-            # Position is preserved from target's REST so bones stay attached
-            # to their chain regardless of source/target proportion differences.
+            # Aim target's `row_tgt_axis` at source's `row_src_axis`. For
+            # AIM_ROLL, also transfer the source's twist around the aim axis
+            # so head/spine/pelvis facing is preserved.
+            #
+            # Axis dropdowns default to '+Y' / '+Y' (along-bone → along-bone),
+            # which is the natural aim. Pick '-Y' on either side to flip the
+            # aim direction (fixes cases like Sintel head where target's
+            # natural aim ends up backward). Pick +X/+Z to use a different
+            # local axis entirely (rare but supported).
+            #
+            # Position is preserved from target's REST (parent-driven) so
+            # bones stay attached to their chain regardless of source/target
+            # proportion differences.
             from mathutils import Vector, Matrix as _M
-            src_y = target_world.col[1].to_3d()
+            src_aim = _axis_vec_from_matrix(target_world, row_src_axis)
             tgt_rest_world = dst.matrix_world @ pb.bone.matrix_local
-            tgt_y = tgt_rest_world.col[1].to_3d()
-            if src_y.length < 1e-6 or tgt_y.length < 1e-6:
-                cur = dst_world_inv @ tgt_rest_world
-                new_matrix = cur
+            tgt_aim = _axis_vec_from_matrix(tgt_rest_world, row_tgt_axis)
+            if src_aim.length < 1e-6 or tgt_aim.length < 1e-6:
+                new_matrix = dst_world_inv @ tgt_rest_world
             else:
-                src_y.normalize(); tgt_y.normalize()
-                # First bring target rest orientation so its Y aligns with source Y.
-                aim_quat = tgt_y.rotation_difference(src_y)
+                src_aim.normalize(); tgt_aim.normalize()
+                aim_quat = tgt_aim.rotation_difference(src_aim)
                 after_aim_3x3 = aim_quat.to_matrix() @ tgt_rest_world.to_3x3()
 
                 if row_mode == 'AIM_ROLL':
-                    # Compute the roll (twist) around src Y that transforms the
-                    # after-aim X axis into the source's X axis. That extra
-                    # rotation carries the character's yaw/facing forward.
-                    src_x = target_world.col[0].to_3d()
-                    aim_x = after_aim_3x3.col[0].to_3d()
-                    # Project both onto the plane perpendicular to src_y so we
-                    # can measure a pure twist around src_y.
+                    # Twist match: pick a "roll reference" axis perpendicular
+                    # to the aim axis on both source and target. Historically
+                    # aim was +Y and roll reference was +X; generalize by
+                    # cycling: for aim Y use X, for aim X or Z use Y.
+                    src_ref_letter = _perp_axis_letter(row_src_axis)
+                    tgt_ref_letter = _perp_axis_letter(row_tgt_axis)
+                    src_ref = _axis_vec_from_matrix(target_world, '+' + src_ref_letter)
+                    aim_ref = _axis_vec_from_matrix(_M(after_aim_3x3).to_4x4(),
+                                                     '+' + tgt_ref_letter)
+                    # Project onto plane perpendicular to src_aim so twist is
+                    # measured as a pure rotation around src_aim.
                     def _project(v, axis):
-                        return (v - axis * v.dot(axis))
-                    src_x_p = _project(src_x, src_y)
-                    aim_x_p = _project(aim_x, src_y)
-                    if src_x_p.length > 1e-6 and aim_x_p.length > 1e-6:
-                        src_x_p.normalize(); aim_x_p.normalize()
-                        cos_t = max(-1.0, min(1.0, aim_x_p.dot(src_x_p)))
+                        return v - axis * v.dot(axis)
+                    src_ref_p = _project(src_ref, src_aim)
+                    aim_ref_p = _project(aim_ref, src_aim)
+                    if src_ref_p.length > 1e-6 and aim_ref_p.length > 1e-6:
+                        src_ref_p.normalize(); aim_ref_p.normalize()
+                        cos_t = max(-1.0, min(1.0, aim_ref_p.dot(src_ref_p)))
                         import math as _math
                         twist_angle = _math.acos(cos_t)
-                        # Signed angle around src_y
-                        cross = aim_x_p.cross(src_x_p)
-                        if cross.dot(src_y) < 0:
+                        cross = aim_ref_p.cross(src_ref_p)
+                        if cross.dot(src_aim) < 0:
                             twist_angle = -twist_angle
-                        twist_quat = Quaternion(src_y, twist_angle)
+                        twist_quat = Quaternion(src_aim, twist_angle)
                         after_aim_3x3 = twist_quat.to_matrix() @ after_aim_3x3
 
                 new_world = after_aim_3x3.to_4x4()
@@ -680,19 +858,19 @@ def _copy_pose(src, dst, entries, global_position_only, reset_first, report, com
                 # Parent-driven translation — follows parent chain when a
                 # DELTA-mode ancestor (e.g. hip) has been moved.
                 new_matrix.translation = _attached_local_trans()
-        else:  # FULL
-            # For FINGER bones we can't just copy the source's world rotation:
-            # source and target rigs have subtly different bone-local X/Z
-            # conventions per finger (and per side), so raw copy gets some
-            # fingers right and inverts others (e.g. Rigify's middle vs ring
-            # metacarpal roll differ). Instead we transfer the anatomical
-            # frame — Y along the bone plus palm-plane normal — the same way
-            # hand_ik is handled. This is convention-invariant.
+        elif row_mode == 'FINGER':
+            # Finger-specific: transfer using palm-normal anatomical frame.
+            # Source and target rigs have subtly different bone-local X/Z
+            # conventions per finger (and per side), so raw FULL rotation copy
+            # gets some fingers right and inverts others (e.g. Rigify's middle
+            # vs ring metacarpal roll differ). Anatomical-frame transfer
+            # (Y along the bone plus palm-plane normal) is convention-invariant
+            # and carries curl properly.
             #
             # Position must FOLLOW THE PARENT (basis.translation = 0) because
             # the finger's parent (hand chain) has already been moved by the
-            # Pass-1 IK solve; pinning the finger to its armature-local rest
-            # translation would leave it disconnected from the moved hand.
+            # earlier IK/FK arm pose; pinning the finger to its armature-local
+            # rest translation would leave it disconnected from the moved hand.
             if source_bone and _is_finger_source(source_bone):
                 side = source_bone[0]  # 'l' or 'r'
                 src_palm = _src_palm(side)
@@ -710,32 +888,46 @@ def _copy_pose(src, dst, entries, global_position_only, reset_first, report, com
                         delta_world_3x3 = src_frame @ tgt_frame_rest.inverted()
                         new_world_rot = delta_world_3x3 @ tgt_rest_world.to_3x3()
                         new_local_rot = (dst_world_3x3_inv @ new_world_rot).to_quaternion()
-                        # Parent-driven translation → basis.translation = 0 →
-                        # finger stays glued to the parent as the hand chain moves.
                         new_matrix = Matrix.LocRotScale(
                             _attached_local_trans(), new_local_rot, (1.0, 1.0, 1.0))
             if new_matrix is None:
-                # Non-finger FULL bone, or finger with missing landmarks —
-                # copy source's world rotation with PARENT-DRIVEN translation
-                # (was rest-world translation, which detached the bone from
-                # any DELTA-lowered ancestor like the hip).
+                # FINGER mode but source isn't a recognized MHR finger, or
+                # palm-normal landmarks weren't found. Fall back to plain
+                # FULL rotation copy so we at least produce something.
                 _, rot, _ = new_local.decompose()
                 new_matrix = Matrix.LocRotScale(
                     _attached_local_trans(), rot, (1.0, 1.0, 1.0))
-
-        # Apply per-row Z-axis flip only for modes that copy source's X/Z axes
-        # directly (FULL and AIM_ROLL). AIM only aligns Y; DELTA works in
-        # target's rest frame — both are already Z-convention-agnostic and
-        # would double-flip if we applied the correction here. POS doesn't
-        # copy rotation at all.
-        if row_flip_z and row_mode in ('FULL', 'AIM_ROLL'):
-            # Rotate around the bone's local Y axis, WITHOUT changing its
-            # translation. Post-multiplying the full matrix would translate
-            # the origin by the rotation applied to the current translation
-            # column, which is why previous versions displaced bones.
-            rot_only = new_matrix.to_3x3() @ _flip_y_180.to_3x3()
+        elif row_mode == 'POS_RAW':
+            # Like POS but skip chain-scaling — use source's RAW world position
+            # instead. Rotation still uses the same anatomical-frame transfer
+            # (palm-normal for hands, foot landmarks for feet) so hand/foot
+            # orientation carries over. Otherwise the IK target sits at the
+            # right spot but with target-rest rotation, which looks twisted.
+            src_pos_local = new_local.translation
+            # Try anatomical rotation transfer first (works for IK-Hand /
+            # IK-Foot). Falls back to source local delta applied to target
+            # rest, matching POS's fallback behavior.
+            src_frame_now, is_hand, ik_side = (
+                _anatomical_ik_source_frame_world(pb, src))
+            reference_frame = (_cached_target_anat(ik_side, is_hand)
+                               if is_hand is not None else None)
+            if src_frame_now is not None and reference_frame is not None:
+                delta_world_3x3 = src_frame_now @ reference_frame.inverted()
+                tgt_rest_world_3x3 = (
+                    dst_world @ _rest_local(pb.bone)).to_3x3()
+                final_world_3x3 = delta_world_3x3 @ tgt_rest_world_3x3
+                tgt_rot_3x3 = dst_world_3x3_inv @ final_world_3x3
+            else:
+                tgt_rot_3x3 = (_rest_local(pb.bone).to_3x3()
+                                @ src_local_delta_q.to_matrix())
             new_matrix = Matrix.LocRotScale(
-                new_matrix.to_translation(), rot_only.to_quaternion(), (1.0, 1.0, 1.0))
+                src_pos_local, tgt_rot_3x3.to_quaternion(), (1.0, 1.0, 1.0))
+        else:  # FULL
+            # Copy source's world rotation with PARENT-DRIVEN translation so
+            # the bone stays attached to its chain as the parent moves.
+            _, rot, _ = new_local.decompose()
+            new_matrix = Matrix.LocRotScale(
+                _attached_local_trans(), rot, (1.0, 1.0, 1.0))
 
         # Apply per-row rotation offset (rest-orientation correction).
         # Rotates in the bone's local frame around its origin, preserving the
@@ -848,19 +1040,53 @@ class SAM3DMappingItem(PropertyGroup):
             ('AIM',      "Aim",      "Aim target Y at source Y, preserve target rest position and rest X/Z. Best for limbs when only aim direction matters."),
             ('AIM_ROLL', "Aim+Roll", "Aim Y plus copy twist around Y. Preserves target rest position. Better than AIM when twist matters."),
             ('DELTA',    "Delta",    "Rotate target from its rest by the delta source rotated from an anatomical canonical (character axes). Preserves rest position. Best for spine/pelvis/head."),
+            ('FINGER',   "Finger",   "Finger-specific: transfer using palm-normal anatomical frame. Convention-invariant across rigs — carries finger curl even when source/target bone rolls differ. Only meaningful when source is an MHR finger bone (l_index1, l_thumb0, etc.)."),
             ('POS',      "Pos",      "Position only; keep target rest rotation. For IK targets (foot_ik, hand_ik), position is scaled to target's chain length so proportions are respected."),
+            ('POS_RAW',  "Pos (raw)","Like Pos but skip chain-scaling — pins the target IK at the source wrist/ankle raw world position. Rotation still uses the anatomical-frame transfer (palm-normal for hands, ankle+toe for feet) so hand/foot orientation carries over. Use when source and target have similar proportions and chain-scaled Pos is landing slightly off."),
             ('SKIP',     "Skip",     "Do not touch this bone. Use after manually adjusting a bone you want to preserve across re-copies."),
         ],
         default='FULL',
         update=_row_updated,
     )
-    flip_z: BoolProperty(
-        name="Flip Z",
-        description="Rotate the transferred pose 180° around this bone's Y-axis. "
-                    "Enable when source and target rigs use opposite Z-axis conventions "
-                    "(one has +Z forward, the other -Z forward). Auto-set by "
-                    "'Auto-set modes' based on rest Z-axis comparison.",
-        default=False,
+    # Per-row axis mapping for AIM / AIM_ROLL — lets the user specify which
+    # axis of the source bone should be "aimed" (default source Y = along the
+    # bone) and which axis of the target should aim in that direction. Fixes
+    # convention mismatches (e.g. Sintel head vs MHR head Z-sign) without
+    # per-row rotation offsets.
+    #
+    # For AIM_ROLL the twist match uses a canonical perpendicular axis (bone
+    # X for a Y aim, or bone Y for X/Z aims). For FULL / DELTA / FINGER / POS
+    # the axis dropdowns are stored but currently have no effect — they only
+    # matter for the AIM family.
+    source_axis: bpy.props.EnumProperty(
+        name="Src axis",
+        description="Which axis of the SOURCE bone to aim / align. Default +Y "
+                    "(along the bone, head-to-tail).",
+        items=[
+            ('+X', "+X", "Source's local +X axis"),
+            ('+Y', "+Y", "Source's local +Y axis (default — along the bone)"),
+            ('+Z', "+Z", "Source's local +Z axis"),
+            ('-X', "-X", "Source's local -X axis"),
+            ('-Y', "-Y", "Source's local -Y axis"),
+            ('-Z', "-Z", "Source's local -Z axis"),
+        ],
+        default='+Y',
+        update=_row_updated,
+    )
+    target_axis: bpy.props.EnumProperty(
+        name="Tgt axis",
+        description="Which axis of the TARGET bone should be aimed at the source axis. "
+                    "Default +Y matches the source (natural aim). Pick -Y (or another axis) "
+                    "to correct for convention mismatches between rigs (e.g. Sintel head).",
+        items=[
+            ('+X', "+X", "Target's local +X axis"),
+            ('+Y', "+Y", "Target's local +Y axis (default)"),
+            ('+Z', "+Z", "Target's local +Z axis"),
+            ('-X', "-X", "Target's local -X axis"),
+            ('-Y', "-Y", "Target's local -Y axis"),
+            ('-Z', "-Z", "Target's local -Z axis"),
+        ],
+        default='+Y',
         update=_row_updated,
     )
     rotation_offset: bpy.props.FloatVectorProperty(
@@ -1002,8 +1228,17 @@ def _prof(props):
 
 def _ensure_default_profile_for_all_scenes():
     """Guarantee every scene has at least one profile so draw + operators
-    see a non-None active profile immediately."""
-    for scene in bpy.data.scenes:
+    see a non-None active profile immediately.
+
+    Blender restricts `bpy.data` during addon registration (bpy.data is a
+    `_RestrictData` object at that point), so we swallow AttributeError and
+    rely on the load_post / load_factory_startup_post handlers to fill in the
+    default profile the next time a scene is actually loaded."""
+    try:
+        scenes = bpy.data.scenes
+    except AttributeError:
+        return
+    for scene in scenes:
         props = getattr(scene, "sam3d_pose_copy", None)
         if props is not None and len(props.profiles) == 0:
             p = props.profiles.add()
@@ -1027,11 +1262,16 @@ class SAM3D_UL_mappings(UIList):
         dst = _prof(props).target_armature
 
         row = layout.row(align=True)
-        row.prop(item, "enabled", text="")
 
-        # Source bone picker — searches source armature's pose bones
+        # Enable checkbox — kept narrow.
+        en = row.row(align=True)
+        en.scale_x = 0.3
+        en.prop(item, "enabled", text="")
+
+        # Source bone picker — a bit narrower so mode + axes get room.
         sub = row.row(align=True)
         sub.enabled = item.enabled
+        sub.scale_x = 0.9
         if src is not None:
             valid_src = item.source_bone in src.pose.bones if item.source_bone else True
             icon_src = 'BONE_DATA' if valid_src else 'ERROR'
@@ -1039,11 +1279,14 @@ class SAM3D_UL_mappings(UIList):
         else:
             sub.prop(item, "source_bone", text="", icon='BONE_DATA')
 
-        row.label(text="→")
+        arrow = row.row(align=True)
+        arrow.scale_x = 0.2
+        arrow.label(text="→")
 
-        # Target bone picker — searches target armature's pose bones
+        # Target bone picker.
         sub = row.row(align=True)
         sub.enabled = item.enabled
+        sub.scale_x = 0.9
         if dst is not None:
             valid_dst = item.target_bone in dst.pose.bones if item.target_bone else True
             icon_dst = 'BONE_DATA' if valid_dst else 'ERROR'
@@ -1051,13 +1294,22 @@ class SAM3D_UL_mappings(UIList):
         else:
             sub.prop(item, "target_bone", text="", icon='BONE_DATA')
 
-        # Per-row mode: FULL / AIM / AIM_ROLL / DELTA / POS
-        sub = row.row(align=True)
-        sub.scale_x = 0.55
-        sub.prop(item, "mode", text="")
+        # Mode — enough width to show full names like "AIM_ROLL", "FINGER".
+        mode = row.row(align=True)
+        mode.scale_x = 0.7
+        mode.prop(item, "mode", text="")
 
-        # Per-row Z-axis flip: rotate 180° around Y to correct opposite Z conventions
-        row.prop(item, "flip_z", text="Z", toggle=True)
+        # Source-axis and target-axis dropdowns. Only meaningful for
+        # AIM / AIM_ROLL, but always shown so the dropdown is discoverable.
+        axis_active = item.mode in ('AIM', 'AIM_ROLL')
+        sa = row.row(align=True)
+        sa.enabled = item.enabled and axis_active
+        sa.scale_x = 0.55
+        sa.prop(item, "source_axis", text="")
+        ta = row.row(align=True)
+        ta.enabled = item.enabled and axis_active
+        ta.scale_x = 0.55
+        ta.prop(item, "target_axis", text="")
 
         # Per-row test button
         op = row.operator("sam3d.copy_row", text="", icon='PLAY')
@@ -1158,7 +1410,8 @@ class SAM3D_OT_copy_mappings(Operator):
                 'target_bone': m.target_bone,
                 'enabled': m.enabled,
                 'mode': m.mode,
-                'flip_z': m.flip_z,
+                'source_axis': m.source_axis,
+                'target_axis': m.target_axis,
                 'rotation_offset': tuple(m.rotation_offset),
             }
             for m in active.mappings
@@ -1172,7 +1425,7 @@ class SAM3D_OT_paste_mappings(Operator):
     bl_label = "Paste mappings"
     bl_description = ("Replace the active profile's mapping rows with the "
                       "clipboard from Copy mappings (preserves source/target "
-                      "names, modes, flip_z, and rotation offsets).")
+                      "names, modes, axes, and rotation offsets).")
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -1192,7 +1445,8 @@ class SAM3D_OT_paste_mappings(Operator):
                 item.target_bone = d['target_bone']
                 item.enabled = d['enabled']
                 item.mode = d['mode']
-                item.flip_z = d['flip_z']
+                item.source_axis = d.get('source_axis', '+Y')
+                item.target_axis = d.get('target_axis', '+Y')
                 item.rotation_offset = d['rotation_offset']
             active.active_mapping_index = 0
         self.report({'INFO'}, f"Pasted {len(_MAPPINGS_CLIPBOARD)} mapping rows.")
@@ -1283,7 +1537,7 @@ class SAM3D_OT_flip_source_180(Operator):
         if getattr(props, "live_update", True) and _prof(props).mappings:
             dst = _prof(props).target_armature
             if dst is not None:
-                entries = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.flip_z) for m in _prof(props).mappings]
+                entries = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.source_axis, m.target_axis) for m in _prof(props).mappings]
                 global _LIVE_COPY_LOCK
                 _LIVE_COPY_LOCK = True
                 try:
@@ -1404,7 +1658,7 @@ class SAM3D_OT_scale_source_to_target(Operator):
 
         # Re-copy so the pose lands at the new proportions
         if getattr(props, "live_update", True) and _prof(props).mappings:
-            entries = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.flip_z) for m in _prof(props).mappings]
+            entries = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.source_axis, m.target_axis) for m in _prof(props).mappings]
             global _LIVE_COPY_LOCK
             _LIVE_COPY_LOCK = True
             try:
@@ -1528,23 +1782,31 @@ def _target_anat_rest_frame_world(dst, side, is_hand):
     if is_hand:
         # Wrist proxy — the "hand IK" or "hand" bone's HEAD is at the wrist joint
         # in Rigify. Falls back to plain hand names.
+        # CloudRig / Sintel patterns are UPPERCASE with dashes (`IK-Hand.L`,
+        # `FK-Hand.L`, `Hand.L`, `DEF-Hand.L`), Rigify uses lowercase with
+        # underscores (`hand_ik.L`, `hand.L`).
         wrist_h = _head_rest_world([
             f"hand_ik.{S}", f"hand.{S}", f"hand_fk.{S}", f"DEF-hand.{S}",
             f"MCH-hand_ik.{S}", f"ORG-hand.{S}",
+            f"IK-Hand.{S}", f"FK-Hand.{S}", f"Hand.{S}", f"DEF-Hand.{S}",
             f"Hand_{side}", f"hand_{side}", f"mixamorig:{S}Hand",
         ])
         # Metacarpal-base bones (f_middle.01.L etc.) — anatomically equivalent
-        # to MHR's l_middle1 / l_index1 / l_pinky1.
+        # to MHR's l_middle1 / l_index1 / l_pinky1. CloudRig / Sintel style
+        # uses `Finger_Middle1.L` etc.
         middle_h = _head_rest_world([
             f"f_middle.01.{S}", f"f_middle_01_{side}", f"middle.01.{S}",
+            f"Finger_Middle1.{S}", f"DEF-Finger_Middle1.{S}",
             f"MiddleFinger1_{side}", f"mixamorig:{S}HandMiddle1",
         ])
         index_h = _head_rest_world([
             f"f_index.01.{S}", f"f_index_01_{side}", f"index.01.{S}",
+            f"Finger_Index1.{S}", f"DEF-Finger_Index1.{S}",
             f"IndexFinger1_{side}", f"mixamorig:{S}HandIndex1",
         ])
         pinky_h = _head_rest_world([
             f"f_pinky.01.{S}", f"f_pinky_01_{side}", f"pinky.01.{S}",
+            f"Finger_Pinky1.{S}", f"DEF-Finger_Pinky1.{S}",
             f"PinkyFinger1_{side}", f"mixamorig:{S}HandPinky1",
         ])
         if any(v is None for v in (wrist_h, middle_h, index_h, pinky_h)):
@@ -1553,14 +1815,17 @@ def _target_anat_rest_frame_world(dst, side, is_hand):
         return _frame_from_y_and_aux(middle_h - wrist_h, aux)
     else:
         # Ankle proxy — foot IK controller head is typically at the ankle/heel.
+        # CloudRig/Sintel uses uppercase with dashes.
         ankle_h = _head_rest_world([
             f"foot_ik.{S}", f"foot.{S}", f"foot_fk.{S}", f"DEF-foot.{S}",
             f"MCH-foot_ik.{S}", f"ORG-foot.{S}",
+            f"IK-Foot.{S}", f"FK-Foot.{S}", f"Foot.{S}", f"DEF-Foot.{S}",
             f"Foot_{side}", f"foot_{side}", f"mixamorig:{S}Foot",
         ])
         toe_h = _head_rest_world([
             f"toe.{S}", f"toe_ik.{S}", f"toe_fk.{S}", f"DEF-toe.{S}",
             f"toes.{S}", f"ORG-toe.{S}",
+            f"Toes.{S}", f"FK-Toes.{S}", f"DEF-Toes.{S}",
             f"Toe_{side}", f"toe_{side}", f"mixamorig:{S}ToeBase",
         ])
         if ankle_h is None or toe_h is None:
@@ -2058,7 +2323,7 @@ class SAM3D_OT_nudge_scale(Operator):
                 _realign_source_foot_to_target(src, dst, tgt_foot)
 
         if getattr(props, "live_update", True) and dst is not None and _prof(props).mappings:
-            entries = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.flip_z) for m in _prof(props).mappings]
+            entries = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.source_axis, m.target_axis) for m in _prof(props).mappings]
             global _LIVE_COPY_LOCK
             _LIVE_COPY_LOCK = True
             try:
@@ -2154,7 +2419,7 @@ class SAM3D_OT_align_source_facing(Operator):
         # sees the pose in the new facing direction. Without this, the target
         # still shows the pose computed before the rotation.
         if getattr(props, "live_update", True) and _prof(props).mappings:
-            entries = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.flip_z) for m in _prof(props).mappings]
+            entries = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.source_axis, m.target_axis) for m in _prof(props).mappings]
             global _LIVE_COPY_LOCK
             _LIVE_COPY_LOCK = True
             try:
@@ -2424,6 +2689,43 @@ class SAM3D_OT_load_rigify_preset(Operator):
         return {'FINISHED'}
 
 
+class SAM3D_OT_load_sintel_preset(Operator):
+    bl_idname = "sam3d.load_sintel_preset"
+    bl_label = "Load Sintel (CloudRig) preset"
+    bl_description = ("Populate the mapping with CloudRig Sintel-metarig defaults "
+                      "(replaces current list). Assumes the target rig was generated "
+                      "from the CloudRig Sintel sample or uses the same FK-/IK-* "
+                      "naming conventions.")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.sam3d_pose_copy
+        with _bulk_mode():
+            _prof(props).mappings.clear()
+            _prof(props).l_arm_pole = "POLE-Arm.L"
+            _prof(props).r_arm_pole = "POLE-Arm.R"
+            _prof(props).l_leg_pole = "POLE-Leg.L"
+            _prof(props).r_leg_pole = "POLE-Leg.R"
+            for entry in SINTEL_DEFAULT_MAPPING:
+                # Rows may be 3-tuple (source, target, mode) or 5-tuple
+                # (source, target, mode, source_axis, target_axis).
+                if len(entry) == 5:
+                    source_bone, target_bone, mode, src_axis, tgt_axis = entry
+                else:
+                    source_bone, target_bone, mode = entry
+                    src_axis, tgt_axis = '+Y', '+Y'
+                item = _prof(props).mappings.add()
+                item.source_bone = source_bone
+                item.target_bone = target_bone
+                item.enabled = (mode != 'SKIP')
+                item.mode = mode
+                item.source_axis = src_axis
+                item.target_axis = tgt_axis
+            _prof(props).active_mapping_index = 0
+        self.report({'INFO'}, f"Loaded {len(SINTEL_DEFAULT_MAPPING)} Sintel default mappings.")
+        return {'FINISHED'}
+
+
 class SAM3D_OT_save_preset(Operator, ExportHelper):
     bl_idname = "sam3d.save_preset"
     bl_label = "Save mapping to file"
@@ -2434,7 +2736,8 @@ class SAM3D_OT_save_preset(Operator, ExportHelper):
         props = context.scene.sam3d_pose_copy
         data = [
             {"source": m.source_bone, "target": m.target_bone,
-             "enabled": m.enabled, "mode": m.mode, "flip_z": m.flip_z,
+             "enabled": m.enabled, "mode": m.mode,
+             "source_axis": m.source_axis, "target_axis": m.target_axis,
              "rotation_offset": list(m.rotation_offset)}
             for m in _prof(props).mappings
         ]
@@ -2463,10 +2766,12 @@ class SAM3D_OT_load_preset(Operator, ImportHelper):
                 item.enabled = bool(entry.get("enabled", True))
                 # Migrate legacy 'position_only' bool to new 'mode' enum.
                 if "mode" in entry:
-                    item.mode = entry["mode"] if entry["mode"] in {'FULL', 'AIM', 'AIM_ROLL', 'DELTA', 'POS'} else 'FULL'
+                    valid_modes = {'FULL', 'AIM', 'AIM_ROLL', 'DELTA', 'FINGER', 'POS', 'POS_RAW'}
+                    item.mode = entry["mode"] if entry["mode"] in valid_modes else 'FULL'
                 else:
                     item.mode = 'POS' if bool(entry.get("position_only", False)) else 'FULL'
-                item.flip_z = bool(entry.get("flip_z", False))
+                item.source_axis = entry.get("source_axis", "+Y")
+                item.target_axis = entry.get("target_axis", "+Y")
                 ro = entry.get("rotation_offset")
                 if ro and len(ro) == 3:
                     item.rotation_offset = (float(ro[0]), float(ro[1]), float(ro[2]))
@@ -2490,7 +2795,7 @@ class SAM3D_OT_copy_row(Operator):
         applied, ms, mt = _copy_pose(
             _prof(props).source_armature,
             _prof(props).target_armature,
-            [(m.source_bone, m.target_bone, True, m.mode, m.flip_z)],
+            [(m.source_bone, m.target_bone, True, m.mode, m.source_axis, m.target_axis)],
             props.position_only,
             False,
             self.report,
@@ -2512,7 +2817,7 @@ class SAM3D_OT_copy_all(Operator):
 
     def execute(self, context):
         props = context.scene.sam3d_pose_copy
-        entries = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.flip_z) for m in _prof(props).mappings]
+        entries = [(m.source_bone, m.target_bone, m.enabled, m.mode, m.source_axis, m.target_axis) for m in _prof(props).mappings]
         applied, ms, mt = _copy_pose(
             _prof(props).source_armature,
             _prof(props).target_armature,
@@ -2537,12 +2842,14 @@ class SAM3D_OT_copy_all(Operator):
 class SAM3D_OT_diagnose(Operator):
     bl_idname = "sam3d.diagnose"
     bl_label = "Diagnose rest-pose alignment"
-    bl_description = ("For each mapping row, compute the angle between the source bone's current "
-                      "Y axis (in world) and the target bone's rest Y axis (in world). "
-                      "Large angles mean copying full rotation will visually twist the target bone.")
+    bl_description = ("Per mapping row: rest-frame Y and Z axis angles between source and target "
+                      "(explains twist / FULL misbehaviour), plus current world-space head "
+                      "position drift (explains 'target didn't reach source pose'). Prints a "
+                      "sorted table and a per-row recommendation to the system console.")
 
     def execute(self, context):
         import math
+        from mathutils import Vector
         props = context.scene.sam3d_pose_copy
         src = _prof(props).source_armature
         dst = _prof(props).target_armature
@@ -2550,9 +2857,69 @@ class SAM3D_OT_diagnose(Operator):
             self.report({'ERROR'}, "Set both armatures first.")
             return {'CANCELLED'}
 
-        prev_mode = dst.mode
-        # We need rest matrices, so briefly reset the pose (then restore basis).
-        # Simpler: use bone.matrix_local which is REST, unaffected by pose.
+        def _axis_angle_deg(a, b):
+            an, bn = a.copy(), b.copy()
+            if an.length < 1e-6 or bn.length < 1e-6:
+                return None
+            an.normalize(); bn.normalize()
+            return math.degrees(math.acos(max(-1.0, min(1.0, an.dot(bn)))))
+
+        def _suggest(y_ang, z_ang, pos_drift_cm, mode, src_pos_only_target,
+                     is_finger, is_torso):
+            """Turn measurements into a short human-readable recommendation.
+
+            Note on why Y/Z angles don't matter for every mode:
+              - DELTA on a torso bone uses a fixed world-space canonical, so
+                the source bone's rest orientation doesn't need to match the
+                target's — big Y/Z° is expected and irrelevant.
+              - AIM / AIM_ROLL compute a fresh rotation from world Y directions,
+                so rest-frame mismatch doesn't affect the result.
+              - FULL is the one mode that DOES need rest axes to agree, so
+                that's where Y/Z° angles become actionable.
+            """
+            if src_pos_only_target and mode != 'POS':
+                return "IK / end-effector — switch to POS"
+            if y_ang is None:
+                return "degenerate axis; skip"
+            # DELTA outside the torso set is a design mismatch — it needs the
+            # canonical Y-up torso rest to make sense.
+            if mode == 'DELTA' and not is_torso:
+                return "DELTA is torso-only — switch to AIM_ROLL (limbs) or AIM (fingers)"
+            # Suggest FINGER for finger sources on any non-FINGER mode.
+            if is_finger and mode not in ('FINGER', 'SKIP'):
+                return "switch to FINGER (palm-normal transfer preserves curl)"
+            # FULL only needs rest axes to agree for the plain-copy path
+            # (i.e. non-finger sources; FINGER now owns the special handling).
+            if mode == 'FULL':
+                if y_ang > 60:
+                    return f"Y axes {y_ang:.0f}° apart — switch to AIM_ROLL"
+                if z_ang is not None and z_ang > 30:
+                    target_mode = 'DELTA' if is_torso else 'AIM_ROLL'
+                    return f"roll ~{z_ang:.0f}° off — switch to {target_mode}"
+            # POS drift for IK end effectors: some drift is EXPECTED when
+            # source and target have different arm-to-leg proportions, because
+            # chain-scaled IK places the target at target's arm length in the
+            # source's direction, not at source's raw wrist position. Only
+            # flag really large drifts (> 25cm) as likely-actionable.
+            if pos_drift_cm is not None and pos_drift_cm > 25.0 and mode == 'POS':
+                return (f"end-effector drifted {pos_drift_cm:.1f}cm — check src "
+                        f"armature scale / facing, or try POS_RAW to skip chain scaling")
+            # Modes that are convention-agnostic (DELTA-on-torso, AIM, AIM_ROLL, POS-with-small-drift):
+            # numeric angles look ugly but don't imply a mode change.
+            return "OK"
+
+        # Rough bone-type classifiers used only for suggestion text.
+        _torso_srcs = {"world", "root", "c_spine0", "c_spine1", "c_spine2",
+                       "c_spine3", "c_neck", "c_head", "c_jaw",
+                       "l_eye", "r_eye"}
+        def _is_finger(src_name):
+            return any(k in src_name for k in
+                       ("thumb", "index", "middle", "ring", "pinky"))
+        def _is_torso(src_name):
+            return src_name in _torso_srcs
+
+        pos_only_targets = {"root", "root.001", "master", "world"}
+
         rows = []
         for m in _prof(props).mappings:
             if not (m.enabled and m.source_bone and m.target_bone):
@@ -2561,26 +2928,61 @@ class SAM3D_OT_diagnose(Operator):
             dst_pb = dst.pose.bones.get(m.target_bone)
             if src_pb is None or dst_pb is None:
                 continue
-            src_world = src.matrix_world @ src_pb.matrix
+
+            # Rest frames in world space — these tell you what CONVENTIONS the
+            # two bones live in, independent of any pose. Post-mismatch here is
+            # a mode-selection issue.
+            src_rest_world = src.matrix_world @ src_pb.bone.matrix_local
             dst_rest_world = dst.matrix_world @ dst_pb.bone.matrix_local
-            src_y = src_world.col[1].to_3d()
-            dst_y = dst_rest_world.col[1].to_3d()
-            if src_y.length < 1e-6 or dst_y.length < 1e-6:
-                continue
-            src_y.normalize(); dst_y.normalize()
-            cos_a = max(-1.0, min(1.0, src_y.dot(dst_y)))
-            angle_deg = math.degrees(math.acos(cos_a))
-            rows.append((angle_deg, m.source_bone, m.target_bone, m.mode))
+            y_ang = _axis_angle_deg(src_rest_world.col[1].to_3d(),
+                                    dst_rest_world.col[1].to_3d())
+            z_ang = _axis_angle_deg(src_rest_world.col[2].to_3d(),
+                                    dst_rest_world.col[2].to_3d())
 
-        rows.sort(reverse=True)  # worst-aligned first
-        print("[SAM3D Pose Copy] Rest-pose Y-axis alignment (higher angle = more mismatch):")
-        print(f"  {'angle°':>6}  {'src':<15}  {'tgt':<25}  mode")
-        for a, s, t, mo in rows:
-            print(f"  {a:6.1f}  {s:<15}  {t:<25}  {mo}")
+            # Post-pose world head positions — where each bone actually is right
+            # NOW. Drift here after a copy = position/chain-scaling issue.
+            src_head_w = src.matrix_world @ src_pb.head
+            dst_head_w = dst.matrix_world @ dst_pb.head
+            pos_drift_cm = (src_head_w - dst_head_w).length * 100.0
 
-        # Summary: how many rows are >45° misaligned
-        bad = sum(1 for a, _, _, _ in rows if a > 45)
-        self.report({'INFO'}, f"Diagnosed {len(rows)} rows; {bad} rows with >45° Y-axis mismatch. See console.")
+            tgt_is_end_effector = (
+                'ik' in m.target_bone.lower() or 'foot' in m.target_bone.lower()
+                and m.target_bone.lower().startswith(('ik', 'foot_ik', 'hand_ik'))
+            )
+            suggestion = _suggest(
+                y_ang, z_ang, pos_drift_cm, m.mode,
+                m.target_bone.lower() in pos_only_targets or tgt_is_end_effector,
+                _is_finger(m.source_bone),
+                _is_torso(m.source_bone),
+            )
+            rows.append((y_ang or 0.0, z_ang or 0.0, pos_drift_cm,
+                         m.source_bone, m.target_bone, m.mode, suggestion))
+
+        # Keep rows in UI order (mapping list order) so the console lines up
+        # with what the user sees in the panel — makes correlating a specific
+        # row to its diagnosis much easier than a worst-first sort.
+
+        print()
+        print("[SAM3D Pose Copy] Diagnose ─ per-row rest & pose analysis")
+        print("=" * 108)
+        print(f"  {'Y°':>4}  {'Z°':>4}  {'drift':>6}  {'src':<16}  {'tgt':<26}  {'mode':<6}  suggestion")
+        print("  " + "-" * 104)
+        for y, z, d, s, t, mo, sug in rows:
+            drift = f"{d:5.1f}cm" if d is not None else "  n/a "
+            print(f"  {y:4.0f}  {z:4.0f}  {drift}  {s:<16}  {t:<26}  {mo:<6}  {sug}")
+
+        # Summary rollup
+        bad_y = sum(1 for r in rows if r[0] > 45)
+        bad_z = sum(1 for r in rows if r[1] > 30)
+        bad_d = sum(1 for r in rows if (r[2] or 0) > 5)
+        needs_change = sum(1 for r in rows if r[6] != "OK")
+        print("  " + "-" * 104)
+        print(f"  Summary: {len(rows)} enabled rows, "
+              f"{bad_y} Y>45°, {bad_z} Z>30°, {bad_d} drift>5cm, "
+              f"{needs_change} rows with a suggested change.")
+        print()
+        self.report({'INFO'}, f"Diagnosed {len(rows)} rows; {needs_change} have a suggested fix. "
+                              f"See console (Window → Toggle System Console).")
         return {'FINISHED'}
 
 
@@ -2625,7 +3027,7 @@ class SAM3D_OT_auto_set_modes(Operator):
             return any(h in n for h in ik_target_hints)
         threshold = props.auto_mode_threshold
         counts = {'FULL': 0, 'AIM': 0, 'AIM_ROLL': 0, 'DELTA': 0, 'POS': 0}
-        flip_z_count = 0
+        z_flipped_count = 0  # rows where auto-detect set target_axis to -Y
         with _bulk_mode():
             for m in _prof(props).mappings:
                 if not (m.enabled and m.source_bone and m.target_bone):
@@ -2688,21 +3090,24 @@ class SAM3D_OT_auto_set_modes(Operator):
                 counts[m.mode] += 1
 
                 # Detect Z-axis convention mismatch. If source rest Z and target
-                # rest Z point roughly opposite (dot < 0), the rigs use opposite
-                # Z conventions and FULL/AIM copy visually inverts the bone.
-                # Set flip_z to correct.
+                # rest Z point roughly opposite (dot < 0), the two rigs use
+                # opposite Z conventions — flip the target-axis dropdown to
+                # -Y so the AIM path takes the correction into account.
                 src_z = src_world.col[2].to_3d()
                 dst_z = dst_rest_world.col[2].to_3d()
                 if src_z.length > 1e-6 and dst_z.length > 1e-6:
                     src_z.normalize(); dst_z.normalize()
-                    m.flip_z = src_z.dot(dst_z) < 0
-                    if m.flip_z:
-                        flip_z_count += 1
+                    if src_z.dot(dst_z) < 0:
+                        m.target_axis = '-Y'
+                        z_flipped_count += 1
+                    else:
+                        m.target_axis = '+Y'
         self.report(
             {'INFO'},
             f"Set modes: FULL={counts['FULL']}, AIM={counts['AIM']}, "
             f"AIM_ROLL={counts['AIM_ROLL']}, DELTA={counts['DELTA']}, "
-            f"POS={counts['POS']}; Z-flipped={flip_z_count} (threshold {threshold:.0f}°)"
+            f"POS={counts['POS']}; target-axis flipped to -Y on {z_flipped_count} "
+            f"rows (threshold {threshold:.0f}°)"
         )
         return {'FINISHED'}
 
@@ -3142,7 +3547,8 @@ class SAM3D_PT_pose_panel(Panel):
         col.separator()
         col.operator("sam3d.clear_mappings", icon='TRASH', text="")
 
-        # Per-row rotation offset editor (for the active row).
+        # Per-row rotation offset editor (for the active row). Axis dropdowns
+        # live in the row itself now.
         idx = _prof(props).active_mapping_index
         if 0 <= idx < len(_prof(props).mappings):
             active_row = _prof(props).mappings[idx]
@@ -3192,6 +3598,7 @@ class SAM3D_PT_pose_panel(Panel):
         # Presets + preset save/load
         row = layout.row(align=True)
         row.operator("sam3d.load_rigify_preset", icon='ARMATURE_DATA')
+        row.operator("sam3d.load_sintel_preset", icon='OUTLINER_OB_ARMATURE')
         row = layout.row(align=True)
         row.operator("sam3d.save_preset", icon='FILE_TICK')
         row.operator("sam3d.load_preset", icon='FILEBROWSER')
@@ -3281,6 +3688,7 @@ classes = (
     SAM3D_OT_import_source_fbx,
     SAM3D_OT_repose_source_fbx,
     SAM3D_OT_load_rigify_preset,
+    SAM3D_OT_load_sintel_preset,
     SAM3D_OT_save_preset,
     SAM3D_OT_load_preset,
     SAM3D_OT_copy_row,
