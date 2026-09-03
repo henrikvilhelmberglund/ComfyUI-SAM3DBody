@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SAM3D Pose Copy",
     "author": "ComfyUI-SAM3DBody",
-    "version": (4, 6, 4),
+    "version": (4, 7, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > SAM3D",
     "description": "Interactively map bones from a SAM3D-Body MHR posed skeleton onto any target armature.",
@@ -248,7 +248,7 @@ SINTEL_DEFAULT_MAPPING = [
 ]
 
 
-RIGIFY_DEFAULT_MAPPING = [
+RIGIFY_EDIT_MAPPING = [
     # Ground master + pelvis
     ("world",      "root"),          # MHR world (ground) -> Rigify ground master
     ("root",       "spine_fk"),      # MHR "root" is the pelvis -> Rigify FK spine base
@@ -328,6 +328,101 @@ RIGIFY_DEFAULT_MAPPING = [
     ("r_pinky1",   "f_pinky.01.R"),
     ("r_pinky2",   "f_pinky.02.R"),
     ("r_pinky3",   "f_pinky.03.R"),
+]
+
+
+# (source_bone, target_bone, mode) — matches vanilla Blender Rigify Human rig
+# (generated from Add → Armature → Human Meta-Rig → Rigify Buttons → Generate).
+# Same per-body-part mode conventions as the Sintel preset:
+#   DELTA    — torso (spine, chest, neck, head, jaw, eyes)
+#   AIM_ROLL — limbs (clavicle, arms, thigh/shin/foot)
+#   FINGER   — fingers (uses palm-normal anatomical transfer)
+#   POS      — IK end effectors (hand_ik, foot_ik)
+#
+# Difference from the (edit) preset:
+#   - Toe target is `toe_fk.{L,R}` (standard Rigify split-toe naming), not
+#     `toe.{L,R}` which doesn't exist on a vanilla generated rig.
+#   - Correct modes per body part instead of blanket FULL.
+RIGIFY_STANDARD_MAPPING = [
+    # Ground master + pelvis
+    ("world",      "root",             "POS"),
+    ("root",       "spine_fk",         "DELTA"),
+    ("c_spine0",   "spine_fk.001",     "DELTA"),
+    ("c_spine1",   "spine_fk.002",     "DELTA"),
+    ("c_spine2",   "spine_fk.003",     "DELTA"),
+    ("c_spine3",   "chest",            "DELTA"),
+
+    # Neck / head / face
+    ("c_neck",     "neck",             "DELTA"),
+    ("c_head",     "head",             "DELTA"),
+    ("c_jaw",      "jaw_master",       "DELTA"),
+    ("l_eye",      "eye.L",            "DELTA"),
+    ("r_eye",      "eye.R",            "DELTA"),
+
+    # Left arm
+    ("l_clavicle", "shoulder.L",       "AIM_ROLL"),
+    ("l_uparm",    "upper_arm_fk.L",   "AIM_ROLL"),
+    ("l_lowarm",   "forearm_fk.L",     "AIM_ROLL"),
+    ("l_wrist",    "hand_ik.L",        "POS"),
+    ("l_wrist",    "hand_fk.L",        "AIM_ROLL"),
+
+    # Right arm
+    ("r_clavicle", "shoulder.R",       "AIM_ROLL"),
+    ("r_uparm",    "upper_arm_fk.R",   "AIM_ROLL"),
+    ("r_lowarm",   "forearm_fk.R",     "AIM_ROLL"),
+    ("r_wrist",    "hand_ik.R",        "POS"),
+    ("r_wrist",    "hand_fk.R",        "AIM_ROLL"),
+
+    # Left leg — subtalar (below ankle) drives IK for correct heel height,
+    # l_ball (base of toes) drives FK-Foot (matches Rigify foot_fk Y convention
+    # better than l_foot, which points at the subtalar via the tail override).
+    ("l_upleg",    "thigh_fk.L",       "AIM_ROLL"),
+    ("l_lowleg",   "shin_fk.L",        "AIM_ROLL"),
+    ("l_subtalar", "foot_ik.L",        "POS"),
+    ("l_ball",     "foot_fk.L",        "AIM_ROLL"),
+    ("l_ball",     "toe_fk.L",         "SKIP"),
+
+    # Right leg
+    ("r_upleg",    "thigh_fk.R",       "AIM_ROLL"),
+    ("r_lowleg",   "shin_fk.R",        "AIM_ROLL"),
+    ("r_subtalar", "foot_ik.R",        "POS"),
+    ("r_ball",     "foot_fk.R",        "AIM_ROLL"),
+    ("r_ball",     "toe_fk.R",         "SKIP"),
+
+    # Fingers — MHR only tracks 3 phalanges per non-thumb finger. Rigify's
+    # `f_XXX.03.L` is the last phalanx (fingertip anchor); we don't map a 4th.
+    # Pinky's carpal joint in MHR (l_pinky0) has no Rigify equivalent.
+    ("l_thumb0",   "thumb.01.L",       "FINGER"),
+    ("l_thumb1",   "thumb.02.L",       "FINGER"),
+    ("l_thumb2",   "thumb.03.L",       "FINGER"),
+    ("l_index1",   "f_index.01.L",     "FINGER"),
+    ("l_index2",   "f_index.02.L",     "FINGER"),
+    ("l_index3",   "f_index.03.L",     "FINGER"),
+    ("l_middle1",  "f_middle.01.L",    "FINGER"),
+    ("l_middle2",  "f_middle.02.L",    "FINGER"),
+    ("l_middle3",  "f_middle.03.L",    "FINGER"),
+    ("l_ring1",    "f_ring.01.L",      "FINGER"),
+    ("l_ring2",    "f_ring.02.L",      "FINGER"),
+    ("l_ring3",    "f_ring.03.L",      "FINGER"),
+    ("l_pinky1",   "f_pinky.01.L",     "FINGER"),
+    ("l_pinky2",   "f_pinky.02.L",     "FINGER"),
+    ("l_pinky3",   "f_pinky.03.L",     "FINGER"),
+
+    ("r_thumb0",   "thumb.01.R",       "FINGER"),
+    ("r_thumb1",   "thumb.02.R",       "FINGER"),
+    ("r_thumb2",   "thumb.03.R",       "FINGER"),
+    ("r_index1",   "f_index.01.R",     "FINGER"),
+    ("r_index2",   "f_index.02.R",     "FINGER"),
+    ("r_index3",   "f_index.03.R",     "FINGER"),
+    ("r_middle1",  "f_middle.01.R",    "FINGER"),
+    ("r_middle2",  "f_middle.02.R",    "FINGER"),
+    ("r_middle3",  "f_middle.03.R",    "FINGER"),
+    ("r_ring1",    "f_ring.01.R",      "FINGER"),
+    ("r_ring2",    "f_ring.02.R",      "FINGER"),
+    ("r_ring3",    "f_ring.03.R",      "FINGER"),
+    ("r_pinky1",   "f_pinky.01.R",     "FINGER"),
+    ("r_pinky2",   "f_pinky.02.R",     "FINGER"),
+    ("r_pinky3",   "f_pinky.03.R",     "FINGER"),
 ]
 
 
@@ -2663,10 +2758,14 @@ class SAM3D_OT_auto_match(Operator):
         return {'FINISHED'}
 
 
-class SAM3D_OT_load_rigify_preset(Operator):
-    bl_idname = "sam3d.load_rigify_preset"
-    bl_label = "Load Rigify preset"
-    bl_description = "Populate the mapping with the built-in Rigify Human metarig defaults (replaces current list)"
+class SAM3D_OT_load_rigify_edit_preset(Operator):
+    bl_idname = "sam3d.load_rigify_edit_preset"
+    bl_label = "Load Rigify (edit) preset"
+    bl_description = ("Populate the mapping with the legacy Rigify defaults — "
+                      "kept for compatibility with the older mode assignments "
+                      "(FULL for most rows, DELTA for master/root). For a "
+                      "vanilla Blender Rigify Human rig, prefer the (standard) "
+                      "preset instead.")
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -2678,14 +2777,50 @@ class SAM3D_OT_load_rigify_preset(Operator):
             _prof(props).r_arm_pole = "upper_arm_ik_target.R"
             _prof(props).l_leg_pole = "thigh_ik_target.L"
             _prof(props).r_leg_pole = "thigh_ik_target.R"
-            for source_bone, target_bone in RIGIFY_DEFAULT_MAPPING:
+            for source_bone, target_bone in RIGIFY_EDIT_MAPPING:
                 item = _prof(props).mappings.add()
                 item.source_bone = source_bone
                 item.target_bone = target_bone
                 item.enabled = True
                 item.mode = 'DELTA' if target_bone.lower() in position_only_targets else 'FULL'
             _prof(props).active_mapping_index = 0
-        self.report({'INFO'}, f"Loaded {len(RIGIFY_DEFAULT_MAPPING)} Rigify default mappings.")
+        self.report({'INFO'}, f"Loaded {len(RIGIFY_EDIT_MAPPING)} Rigify (edit) mappings.")
+        return {'FINISHED'}
+
+
+class SAM3D_OT_load_rigify_standard_preset(Operator):
+    bl_idname = "sam3d.load_rigify_standard_preset"
+    bl_label = "Load Rigify (standard) preset"
+    bl_description = ("Populate the mapping to match a vanilla Blender Rigify "
+                      "Human rig (generated from Add → Armature → Human Meta-Rig, "
+                      "then Rigify Buttons → Generate). Uses the per-body-part "
+                      "mode conventions: DELTA for torso, AIM_ROLL for limbs, "
+                      "FINGER for fingers, POS for IK end effectors.")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.sam3d_pose_copy
+        with _bulk_mode():
+            _prof(props).mappings.clear()
+            _prof(props).l_arm_pole = "upper_arm_ik_target.L"
+            _prof(props).r_arm_pole = "upper_arm_ik_target.R"
+            _prof(props).l_leg_pole = "thigh_ik_target.L"
+            _prof(props).r_leg_pole = "thigh_ik_target.R"
+            for entry in RIGIFY_STANDARD_MAPPING:
+                if len(entry) == 5:
+                    source_bone, target_bone, mode, src_axis, tgt_axis = entry
+                else:
+                    source_bone, target_bone, mode = entry
+                    src_axis, tgt_axis = '+Y', '+Y'
+                item = _prof(props).mappings.add()
+                item.source_bone = source_bone
+                item.target_bone = target_bone
+                item.enabled = (mode != 'SKIP')
+                item.mode = mode
+                item.source_axis = src_axis
+                item.target_axis = tgt_axis
+            _prof(props).active_mapping_index = 0
+        self.report({'INFO'}, f"Loaded {len(RIGIFY_STANDARD_MAPPING)} Rigify (standard) mappings.")
         return {'FINISHED'}
 
 
@@ -3597,8 +3732,13 @@ class SAM3D_PT_pose_panel(Panel):
 
         # Presets + preset save/load
         row = layout.row(align=True)
-        row.operator("sam3d.load_rigify_preset", icon='ARMATURE_DATA')
-        row.operator("sam3d.load_sintel_preset", icon='OUTLINER_OB_ARMATURE')
+        row.operator("sam3d.load_rigify_standard_preset", icon='ARMATURE_DATA',
+                     text="Rigify (standard)")
+        row.operator("sam3d.load_rigify_edit_preset", icon='ARMATURE_DATA',
+                     text="Rigify (edit)")
+        row = layout.row(align=True)
+        row.operator("sam3d.load_sintel_preset", icon='OUTLINER_OB_ARMATURE',
+                     text="Sintel (CloudRig)")
         row = layout.row(align=True)
         row.operator("sam3d.save_preset", icon='FILE_TICK')
         row.operator("sam3d.load_preset", icon='FILEBROWSER')
@@ -3687,7 +3827,8 @@ classes = (
     SAM3D_OT_reimport_source,
     SAM3D_OT_import_source_fbx,
     SAM3D_OT_repose_source_fbx,
-    SAM3D_OT_load_rigify_preset,
+    SAM3D_OT_load_rigify_edit_preset,
+    SAM3D_OT_load_rigify_standard_preset,
     SAM3D_OT_load_sintel_preset,
     SAM3D_OT_save_preset,
     SAM3D_OT_load_preset,
